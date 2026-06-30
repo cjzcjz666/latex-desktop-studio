@@ -1,4 +1,4 @@
-import Editor, { type OnMount } from "@monaco-editor/react";
+import Editor from "@monaco-editor/react";
 import type { editor as MonacoEditor } from "monaco-editor";
 import {
   AlertTriangle,
@@ -52,6 +52,8 @@ import {
   type CSSProperties,
   type FormEvent as ReactFormEvent,
   type PointerEvent as ReactPointerEvent,
+  lazy,
+  Suspense,
   useEffect,
   useMemo,
   useRef,
@@ -59,24 +61,41 @@ import {
 } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { AssetPreview } from "./components/AssetPreview";
+import { CodexDiffView } from "./components/CodexDiffView";
 import { FileTreeNode } from "./components/FileTreeNode";
-import { PdfPreview } from "./components/PdfPreview";
 import {
+  codexContextKindLabel,
+  codexContextLineRange,
+  codexContextSource as codexCitationSource,
+  formatCodexContextHint,
+} from "./lib/codexContext";
+import {
+  codexDiffHunkKey,
+  codexDiffHunkReviewStats,
   eventMatchesShortcut,
-  formatParsedDiffFile,
+  formatParsedDiffHunk,
+  formatCodexAnswerReviewComment,
   isReviewEndCommentLine,
   latexCommentStartIndex,
   normalizeShortcutInput,
+  parsedDiffHunks,
   parseLatexTodoCommentText,
   parseUnifiedDiff,
   codexSymbolMentionTokens,
+  revertParsedDiffHunkInContent,
   resolveCodexFileMentionPaths,
   shortcutFromKeyboardEvent,
   stripLatexLineComment,
   type ParsedDiffFile,
+  type ParsedDiffHunk,
   type ParsedDiffLine,
 } from "./lib/editorLogic";
+import {
+  configureMonacoLatexTheme,
+  languageForPath,
+  MONACO_LATEX_THEME,
+  type MonacoApi,
+} from "./lib/monacoLatex";
 import {
   cancelCodexRun,
   cancelCompile,
@@ -130,6 +149,7 @@ import {
   updateProjectSettings,
 } from "./tauri";
 import type {
+  CodexEditorContext,
   CodexRunEvent,
   CodexHistoryItem,
   CompileEvent,
@@ -154,6 +174,13 @@ import type {
   SearchResult,
   WordCountResult,
 } from "./types";
+
+const PdfPreview = lazy(() =>
+  import("./components/PdfPreview").then((module) => ({ default: module.PdfPreview })),
+);
+const AssetPreview = lazy(() =>
+  import("./components/AssetPreview").then((module) => ({ default: module.AssetPreview })),
+);
 
 const textExtensions = new Set([
   "tex",
@@ -393,33 +420,6 @@ type BibEntryDraft = {
   insertCitation: boolean;
 };
 
-type CodexEditorContext = {
-  file: string;
-  cursorLine: number;
-  cursorColumn: number;
-  activeSection?: {
-    kind: OutlineItem["kind"];
-    title: string;
-    line: number;
-    level: number;
-  };
-  activeSectionSource?: {
-    startLine: number;
-    endLine: number;
-    text: string;
-    truncated: boolean;
-  };
-  selectedText: string;
-  selectedCharCount: number;
-  selectionStartLine?: number;
-  selectionEndLine?: number;
-  truncated: boolean;
-  nearbyStartLine: number;
-  nearbyEndLine: number;
-  nearbyText: string;
-  nearbyTruncated: boolean;
-};
-
 type CodexReferencedFileContext = {
   path: string;
   content: string;
@@ -478,10 +478,6 @@ type ShortcutActionId =
   | "exportPdf"
   | "cleanBuild";
 type ShortcutMap = Record<ShortcutActionId, string>;
-
-type MonacoApi = Parameters<OnMount>[1];
-const MONACO_LATEX_THEME = "latex-studio-light";
-let isMonacoLatexConfigured = false;
 
 const RESIZE_HANDLE_WIDTH = 12;
 const MIN_EDITOR_WIDTH = 320;
@@ -663,6 +659,7 @@ export function App() {
   const [historyDiffItem, setHistoryDiffItem] = useState<ProjectHistoryItem | null>(null);
   const [historyRestoreItem, setHistoryRestoreItem] = useState<ProjectHistoryItem | null>(null);
   const [diffSummary, setDiffSummary] = useState<DiffSummary | null>(null);
+  const [acceptedCodexHunkKeys, setAcceptedCodexHunkKeys] = useState<string[]>([]);
   const [hiddenCodexHighlightRunId, setHiddenCodexHighlightRunId] = useState<string | null>(null);
   const [isCodexRevertConfirmVisible, setIsCodexRevertConfirmVisible] = useState(false);
   const [isCompiling, setIsCompiling] = useState(false);
@@ -862,9 +859,9 @@ export function App() {
   const activeCodexChangeLines = useMemo(
     () =>
       isCodexHighlightVisible && activePath && diffSummary
-        ? codexChangedLineNumbersForPath(diffSummary, activePath)
+        ? codexChangedLineNumbersForPath(diffSummary, activePath, acceptedCodexHunkKeys)
         : [],
-    [activePath, diffSummary, isCodexHighlightVisible],
+    [acceptedCodexHunkKeys, activePath, diffSummary, isCodexHighlightVisible],
   );
   const activeCodexChangeIndex = activeCodexChangeLines.length
     ? Math.max(
@@ -873,6 +870,25 @@ export function App() {
       )
     : -1;
   const canUseCodexDiffContext = Boolean(diffSummary?.changedFiles.length);
+
+  useEffect(() => {
+    setAcceptedCodexHunkKeys([]);
+  }, [diffSummary?.runId]);
+
+  const codexReviewStats = useMemo(
+    () => (diffSummary ? codexDiffHunkReviewStats(diffSummary.unifiedDiff, acceptedCodexHunkKeys) : null),
+    [acceptedCodexHunkKeys, diffSummary],
+  );
+  const codexReviewBadgeCount =
+    codexReviewStats && codexReviewStats.totalHunks > 0
+      ? codexReviewStats.pendingHunks
+      : diffSummary?.changedFiles.length ?? 0;
+  const codexReviewBadgeTitle =
+    codexReviewStats && codexReviewStats.totalHunks > 0
+      ? `${codexReviewStats.pendingHunks} 个片段待审，${codexReviewStats.acceptedHunks} 个已保留`
+      : diffSummary?.changedFiles.length
+        ? `${diffSummary.changedFiles.length} 个文件发生变化`
+        : "";
 
   useEffect(() => {
     let mounted = true;
@@ -1054,9 +1070,9 @@ export function App() {
       codexDecorationCollectionRef.current = editor.createDecorationsCollection();
     }
     codexDecorationCollectionRef.current.set(
-      codexEditorDecorationsForPath(monacoApi, diffSummary, activePath, model.getLineCount()),
+      codexEditorDecorationsForPath(monacoApi, diffSummary, activePath, model.getLineCount(), acceptedCodexHunkKeys),
     );
-  }, [diffSummary, activePath, activeAsset, isEditorReady, isCodexHighlightVisible]);
+  }, [acceptedCodexHunkKeys, diffSummary, activePath, activeAsset, isEditorReady, isCodexHighlightVisible]);
 
   useEffect(() => {
     const editor = editorRef.current;
@@ -2062,6 +2078,62 @@ export function App() {
       (isCodexDiffContextEnabled && canUseCodexDiffContext) ||
       (isCodexContextOnlyEnabled && canUseCodexContextScope),
   );
+  const codexPreflightItems = useMemo(() => {
+    if (!project || !codexPrompt.trim()) return [];
+    const items: Array<{ key: string; label: string; detail: string; tone?: "scope" | "safe" | "warn" }> = [
+      { key: "project", label: "项目", detail: project.name || shortFileName(project.root) },
+    ];
+    if (pinnedCodexContext) {
+      items.push({
+        key: "pinned",
+        label: codexContextKindLabel(pinnedCodexContext, true),
+        detail: `${shortFileName(pinnedCodexContext.file)}:${pinnedCodexContext.cursorLine}`,
+        tone: "safe",
+      });
+    } else if (!activeAsset && activePath) {
+      items.push({ key: "active", label: "当前文件", detail: shortFileName(activePath), tone: "safe" });
+    }
+    if (codexPromptReferencedFiles.length) {
+      items.push({
+        key: "files",
+        label: `@文件 ${codexPromptReferencedFiles.length}`,
+        detail: codexPromptReferencedFiles.slice(0, 2).map(shortFileName).join("、"),
+        tone: "safe",
+      });
+    }
+    if (codexPromptReferencedSymbols.length) {
+      items.push({
+        key: "symbols",
+        label: `#符号 ${codexPromptReferencedSymbols.length}`,
+        detail: codexPromptReferencedSymbols.slice(0, 2).map((symbol) => symbol.key).join("、"),
+        tone: "safe",
+      });
+    }
+    if (isCodexDiffContextEnabled && canUseCodexDiffContext) {
+      items.push({ key: "diff", label: "带 diff", detail: `${diffSummary?.changedFiles.length ?? 0} 文件`, tone: "warn" });
+    }
+    items.push(
+      isCodexContextOnlyEnabled && canUseCodexContextScope
+        ? { key: "scope", label: "允许修改", detail: `${codexEditableScopeFiles.length} 个上下文文件`, tone: "scope" }
+        : { key: "scope", label: "允许修改", detail: "当前项目内", tone: "warn" },
+    );
+    return items;
+  }, [
+    activeAsset,
+    activePath,
+    canUseCodexContextScope,
+    canUseCodexDiffContext,
+    codexEditableScopeFiles.length,
+    codexPrompt,
+    codexPromptReferencedFiles,
+    codexPromptReferencedSymbols,
+    diffSummary?.changedFiles.length,
+    isCodexContextOnlyEnabled,
+    isCodexDiffContextEnabled,
+    pinnedCodexContext,
+    project,
+  ]);
+  const shouldShowCodexPreflight = Boolean(project && codexPrompt.trim() && !isCodexRunning);
   const hasSuccessfulPdf = Boolean(compileResult?.success);
   const isExistingPdfPreview = Boolean(compileResult?.success && !compileResult.command.length);
   const isPdfPossiblyStale = hasSuccessfulPdf && sourceRevision > compiledSourceRevision;
@@ -3505,8 +3577,12 @@ export function App() {
     );
     setCodexPrompt(prompt);
     setIsCodexCollapsed(false);
+    const allowedFiles = codexAllowedFilesForReferenceIssues([issue], allProjectFiles, projectBibFiles);
     await handleReferenceIssueClick(issue);
-    await runCodexPrompt(projectContext ? `${prompt}\n\n${projectContext}` : prompt, prompt);
+    await runCodexPrompt(projectContext ? `${prompt}\n\n${projectContext}` : prompt, prompt, {
+      allowedFiles,
+      scopeLabel: allowedFiles.length ? `缺失引用相关文件：${allowedFiles.join("、")}` : undefined,
+    });
   }
 
   async function handleFixAllReferenceIssuesWithCodex() {
@@ -3547,8 +3623,12 @@ export function App() {
     );
     setCodexPrompt(prompt);
     setIsCodexCollapsed(false);
+    const allowedFiles = codexAllowedFilesForReferenceIssues(projectReferenceIssues, allProjectFiles, projectBibFiles);
     await handleReferenceIssueClick(projectReferenceIssues[0]);
-    await runCodexPrompt(projectContext ? `${prompt}\n\n${projectContext}` : prompt, prompt);
+    await runCodexPrompt(projectContext ? `${prompt}\n\n${projectContext}` : prompt, prompt, {
+      allowedFiles,
+      scopeLabel: allowedFiles.length ? `缺失引用相关文件：${allowedFiles.length} 个` : undefined,
+    });
   }
 
   openSymbolFromReferenceRef.current = handleOpenSymbol;
@@ -3983,6 +4063,7 @@ export function App() {
       : null;
 
     return {
+      source: "editor",
       file: activePath,
       cursorLine,
       cursorColumn,
@@ -4096,11 +4177,16 @@ export function App() {
     const contextTodos = codexContextTodos(context, effectiveTodos);
 
     if (context.selectedText.trim()) {
+      const isDiffHunkContext = context.source === "diff-hunk";
       locationLines.push(
-        `- Selected range: lines ${context.selectionStartLine}-${context.selectionEndLine}`,
-        "- If the user refers to \"this\", \"selected text\", \"here\", or similar wording, treat this selected range as the target.",
+        isDiffHunkContext
+          ? `- Locked Codex diff hunk range: lines ${context.selectionStartLine}-${context.selectionEndLine}`
+          : `- Selected range: lines ${context.selectionStartLine}-${context.selectionEndLine}`,
+        isDiffHunkContext
+          ? "- This is the exact Codex diff hunk the user chose to continue revising; treat this hunk and its nearby source as the primary target."
+          : "- If the user refers to \"this\", \"selected text\", \"here\", or similar wording, treat this selected range as the target.",
         "",
-        "Selected text:",
+        isDiffHunkContext ? "Current source from locked diff hunk:" : "Selected text:",
         "```latex",
         context.selectedText,
         "```",
@@ -4359,6 +4445,38 @@ export function App() {
     setStatus("已把 Codex 回答转为修改指令，可点击“执行”应用。");
   }
 
+  function handleInsertCodexAnswerAsReviewComment() {
+    const editor = editorRef.current;
+    const selection = editor?.getSelection();
+    const model = editor?.getModel();
+    if (!codexAnswer.trim()) return;
+    if (!editor || !selection || !model || activeAsset || !activePath || !isTextPath(activePath)) {
+      setStatus("当前没有可插入批注的 LaTeX 编辑器。");
+      return;
+    }
+    if (viewMode === "preview") {
+      handleViewModeChange("split");
+    }
+    const indent = model.getLineContent(selection.startLineNumber).match(/^\s*/)?.[0] ?? "";
+    const selectedText = selection.isEmpty() ? "" : model.getValueInRange(selection);
+    const reviewComment = formatCodexAnswerReviewComment(codexAnswer, indent, selectedText);
+    if (!reviewComment) return;
+    editor.executeEdits("codex-answer-review-comment", [
+      {
+        range: selection,
+        text: reviewComment,
+        forceMoveMarkers: true,
+      },
+    ]);
+    markActiveFileDirty(editor.getValue());
+    setIsReviewMode(true);
+    setIsSidebarCollapsed(false);
+    setIsTodosCollapsed(false);
+    setShowResolvedTodos(false);
+    editor.focus();
+    setStatus("已把 Codex 输出插入为 REVIEW 批注；保存后会出现在左侧批注。");
+  }
+
   function handleSendEditorContextToCodex() {
     if (!project || activeAsset || environment?.canRunCodex === false) {
       setStatus("当前没有可交给 Codex 的 LaTeX 编辑器。");
@@ -4468,29 +4586,26 @@ export function App() {
     setStatus(`已移除 ${trigger}${value} 上下文引用。`);
   }
 
-  async function enforceCodexContextScope(summary: DiffSummary, allowedFiles: string[]) {
-    if (!project || !allowedFiles.length || !summary.changedFiles.length) {
-      return { summary, revertedFiles: [] as string[] };
-    }
-    const allowed = new Set(allowedFiles);
-    let nextSummary = summary;
-    const revertedFiles: string[] = [];
-    for (const file of summary.changedFiles) {
-      if (allowed.has(file)) continue;
-      nextSummary = await revertCodexFile(project.root, nextSummary.runId, file);
-      revertedFiles.push(file);
-    }
-    return { summary: nextSummary, revertedFiles };
-  }
-
-  async function runCodexPrompt(prompt: string, displayPrompt = prompt) {
+  async function runCodexPrompt(
+    prompt: string,
+    displayPrompt = prompt,
+    options: { allowedFiles?: string[]; scopeLabel?: string } = {},
+  ) {
     if (!project || !prompt.trim()) return;
-    const contextScopeFiles =
-      isCodexContextOnlyEnabled && codexPrompt.trim() === displayPrompt.trim() ? codexEditableScopeFiles : [];
+    const explicitScopeFiles = uniqueTextPaths((options.allowedFiles ?? []).filter(isTextPath));
+    const contextScopeFiles = explicitScopeFiles.length
+      ? explicitScopeFiles
+      : isCodexContextOnlyEnabled && codexPrompt.trim() === displayPrompt.trim()
+        ? codexEditableScopeFiles
+        : [];
+    const scopedPrompt =
+      explicitScopeFiles.length && !prompt.includes("Codex edit scope lock from LaTeX Studio:")
+        ? `${prompt}\n\n${buildCodexEditScopeContext(explicitScopeFiles)}`
+        : prompt;
     await saveOpenTabsWithHistory("Codex 前保存");
     setCodexPrompt("");
     setPinnedCodexContext(null);
-    setCodexConversationPrompt(displayPrompt.trim());
+    setCodexConversationPrompt(options.scopeLabel ? `${displayPrompt.trim()}\n范围：${options.scopeLabel}` : displayPrompt.trim());
     setCodexRunMode("edit");
     setIsCodexRunning(true);
     setIsCodexCancelling(false);
@@ -4503,12 +4618,13 @@ export function App() {
     try {
       const rawSummary = await runCodexEdit({
         projectRoot: project.root,
-        prompt,
+        prompt: scopedPrompt,
         autoCompile: false,
+        allowedFiles: contextScopeFiles,
       });
-      const scopeResult = await enforceCodexContextScope(rawSummary, contextScopeFiles);
-      const summary = scopeResult.summary;
-      setDiffSummary(summary.changedFiles.length ? summary : null);
+      const summary = rawSummary;
+      const hasScopeRevertedFiles = Boolean(summary.scopeRevertedFiles?.length);
+      setDiffSummary(summary.changedFiles.length || hasScopeRevertedFiles ? summary : null);
       if (summary.changedFiles.length) {
         markSourceEdited();
       }
@@ -4528,10 +4644,11 @@ export function App() {
           recompileError = errorMessage(error);
         }
       }
-      const scopeNotice = scopeResult.revertedFiles.length
-        ? `已自动撤回 ${scopeResult.revertedFiles.length} 个上下文外文件：${scopeResult.revertedFiles
+      const scopeRevertedFiles = summary.scopeRevertedFiles ?? [];
+      const scopeNotice = scopeRevertedFiles.length
+        ? `已自动撤回 ${scopeRevertedFiles.length} 个上下文外文件：${scopeRevertedFiles
             .slice(0, 3)
-            .join("、")}${scopeResult.revertedFiles.length > 3 ? " 等" : ""}。`
+            .join("、")}${scopeRevertedFiles.length > 3 ? " 等" : ""}。`
         : "";
       if (!summary.changedFiles.length) {
         setStatus(scopeNotice || "Codex 已完成，没有文件变化。");
@@ -4588,7 +4705,11 @@ export function App() {
     const prompt = buildCompileFixPrompt(project, result, sourceContext);
     setCodexPrompt(prompt);
     setIsCodexCollapsed(false);
-    await runCodexPrompt(await prepareCodexPrompt(prompt), prompt);
+    const allowedFiles = codexAllowedFilesForDiagnostics(project, result.diagnostics, allProjectFiles);
+    await runCodexPrompt(await prepareCodexPrompt(prompt), prompt, {
+      allowedFiles,
+      scopeLabel: allowedFiles.length ? `编译诊断相关文件：${allowedFiles.length} 个` : undefined,
+    });
   }
 
   async function handleExplainCompileWithCodex(result: CompileResult) {
@@ -4607,7 +4728,11 @@ export function App() {
     setCodexPrompt(prompt);
     setIsCodexCollapsed(false);
     await handleDiagnosticClick(diagnostic);
-    await runCodexPrompt(await prepareCodexPrompt(prompt), prompt);
+    const allowedFiles = codexAllowedFilesForDiagnostics(project, [diagnostic], allProjectFiles);
+    await runCodexPrompt(await prepareCodexPrompt(prompt), prompt, {
+      allowedFiles,
+      scopeLabel: allowedFiles.length ? `当前诊断文件：${allowedFiles.join("、")}` : undefined,
+    });
   }
 
   async function handleExplainDiagnosticWithCodex(result: CompileResult, diagnostic: Diagnostic) {
@@ -4649,7 +4774,11 @@ export function App() {
     setCodexPrompt(prompt);
     setIsCodexCollapsed(false);
     await openTextFile(item.file, { line: item.line });
-    await runCodexPrompt(projectContext ? `${prompt}\n\n${projectContext}` : prompt, prompt);
+    const allowedFiles = codexAllowedFilesForTodos([item], allProjectFiles);
+    await runCodexPrompt(projectContext ? `${prompt}\n\n${projectContext}` : prompt, prompt, {
+      allowedFiles,
+      scopeLabel: allowedFiles.length ? `当前批注文件：${allowedFiles.join("、")}` : undefined,
+    });
   }
 
   async function handleFixAllTodosWithCodex() {
@@ -4699,7 +4828,11 @@ export function App() {
     setIsCodexCollapsed(false);
     setShowResolvedTodos(false);
     await openTextFile(unresolvedTodos[0].file, { line: unresolvedTodos[0].line });
-    await runCodexPrompt(projectContext ? `${prompt}\n\n${projectContext}` : prompt, prompt);
+    const allowedFiles = codexAllowedFilesForTodos(unresolvedTodos, allProjectFiles);
+    await runCodexPrompt(projectContext ? `${prompt}\n\n${projectContext}` : prompt, prompt, {
+      allowedFiles,
+      scopeLabel: allowedFiles.length ? `未解决批注文件：${allowedFiles.length} 个` : undefined,
+    });
   }
 
   async function handleCancelCodex() {
@@ -4766,6 +4899,7 @@ export function App() {
   function handleAcceptCodexChanges() {
     const runId = diffSummary?.runId ?? null;
     setDiffSummary(null);
+    setAcceptedCodexHunkKeys([]);
     setCodexEvents([]);
     setCodexAnswer("");
     setCodexConversationPrompt("");
@@ -4774,6 +4908,48 @@ export function App() {
     setHiddenCodexHighlightRunId(runId);
     codexDecorationCollectionRef.current?.clear();
     setStatus("已确认 Codex 修改。");
+  }
+
+  function handleAcceptCodexHunk(file: string, hunk: ParsedDiffHunk, hunkIndex: number) {
+    const key = codexDiffHunkKey(file, hunk);
+    setAcceptedCodexHunkKeys((current) => (current.includes(key) ? current : [...current, key]));
+    setStatus(`已保留 ${file} 的片段 ${hunkIndex + 1}，该片段已从待审列表隐藏。`);
+  }
+
+  function handleShowAcceptedCodexHunks() {
+    setAcceptedCodexHunkKeys([]);
+    setStatus("已重新显示所有 Codex 修改片段。");
+  }
+
+  function handleReviseCodexHunk(file: string, hunk: ParsedDiffHunk, hunkIndex: number) {
+    if (!project) return;
+    const context = codexEditorContextFromHunk(file, hunk);
+    const hunkDiff = formatParsedDiffHunk({ file, lines: hunk.lines }, hunk);
+    const prompt = [
+      `请基于已锁定的 Codex 修改片段继续修改 @${file}。`,
+      "只处理这个片段附近的源码；优先保持 LaTeX 可编译，不要扩大到无关章节、引用或格式。",
+      "",
+      "当前片段 diff：",
+      "```diff",
+      hunkDiff,
+      "```",
+      "",
+      "你想让 Codex 怎么处理：",
+      "例如：改得更学术、保留原意但更简洁、修复这段引入的编译问题。",
+      "",
+    ].join("\n");
+    setCodexPrompt(prompt);
+    setCodexPromptCursor(prompt.length);
+    setPinnedCodexContext(context);
+    setIsCodexContextOnlyEnabled(true);
+    setIsSidebarCollapsed(false);
+    setIsCodexCollapsed(false);
+    setIsCodexPromptFocused(true);
+    window.requestAnimationFrame(() => {
+      codexPromptInputRef.current?.focus();
+      codexPromptInputRef.current?.setSelectionRange(prompt.length, prompt.length);
+    });
+    setStatus(`已锁定 ${file} 的片段 ${hunkIndex + 1}，在输入框末尾写清要求后执行。`);
   }
 
   async function handleConfirmRevertCodex() {
@@ -4789,6 +4965,7 @@ export function App() {
     await reloadOpenTabsFromDisk();
     setIsCodexRevertConfirmVisible(false);
     setDiffSummary(null);
+    setAcceptedCodexHunkKeys([]);
     setHiddenCodexHighlightRunId(null);
     setStatus("已撤回本次 Codex 修改。可从历史版本恢复撤回前状态。");
   }
@@ -4805,12 +4982,42 @@ export function App() {
     await refreshCodexHistory();
     await reloadOpenTabsFromDisk();
     setDiffSummary(nextSummary.changedFiles.length ? nextSummary : null);
+    setAcceptedCodexHunkKeys([]);
     setHiddenCodexHighlightRunId(null);
     setIsCodexRevertConfirmVisible(false);
     setStatus(
       nextSummary.changedFiles.length
         ? `已撤回 ${file}；本次 Codex 仍有 ${nextSummary.changedFiles.length} 个文件保留修改。`
         : "已撤回本次 Codex 的全部文件修改。",
+    );
+  }
+
+  async function handleRevertCodexHunk(file: string, hunk: ParsedDiffHunk, hunkIndex: number) {
+    if (!project || !diffSummary?.canRevert) return;
+    const runId = diffSummary.runId;
+    setStatus(`正在撤回 ${file} 的第 ${hunkIndex + 1} 个 Codex 修改片段...`);
+    await saveAllOpenTabs();
+    await createProjectHistorySnapshot(project.root, `撤回 Codex 对 ${file} 的片段 ${hunkIndex + 1} 前`);
+    await refreshProjectHistory(project.root);
+    const currentContent = await readFile(project.root, file);
+    const nextContent = revertParsedDiffHunkInContent(currentContent, hunk);
+    if (nextContent === currentContent) {
+      setStatus("这个修改片段没有需要撤回的内容。");
+      return;
+    }
+    await saveFile(project.root, file, nextContent);
+    const nextSummary = await getCodexDiff(project.root, runId);
+    await refreshProjectFiles();
+    await refreshCodexHistory();
+    await reloadOpenTabsFromDisk();
+    setDiffSummary(nextSummary.changedFiles.length ? nextSummary : null);
+    setAcceptedCodexHunkKeys((current) => current.filter((key) => key !== codexDiffHunkKey(file, hunk)));
+    setHiddenCodexHighlightRunId(null);
+    setIsCodexRevertConfirmVisible(false);
+    setStatus(
+      nextSummary.changedFiles.length
+        ? `已撤回 ${file} 的片段 ${hunkIndex + 1}；本次 Codex 仍有 ${nextSummary.changedFiles.length} 个文件保留修改。`
+        : "已撤回本次 Codex 的全部修改片段。",
     );
   }
 
@@ -6063,7 +6270,7 @@ export function App() {
                         <XCircle size={12} />
                       </button>
                     )}
-                    {diffSummary?.changedFiles.length ? <small>{diffSummary.changedFiles.length}</small> : null}
+                    {codexReviewBadgeCount ? <small title={codexReviewBadgeTitle}>{codexReviewBadgeCount}</small> : null}
                   </div>
                 </div>
                 {isCodexCommandCenterActive && (
@@ -6120,8 +6327,18 @@ export function App() {
                             )}
                             <div className="codex-accept-row">
                               <div>
-                                <strong>{diffSummary.changedFiles.length} 个文件发生变化</strong>
-                                <span>确认后隐藏 diff 和编辑器高亮，修改会保留在项目中。</span>
+                                <strong>
+                                  {codexReviewStats && codexReviewStats.totalHunks > 0
+                                    ? codexReviewStats.pendingHunks > 0
+                                      ? `${codexReviewStats.pendingHunks} 个片段待审`
+                                      : "所有片段已保留"
+                                    : `${diffSummary.changedFiles.length} 个文件发生变化`}
+                                </strong>
+                                <span>
+                                  {codexReviewStats && codexReviewStats.totalHunks > 0
+                                    ? `${diffSummary.changedFiles.length} 个文件发生变化，${codexReviewStats.acceptedHunks} 个片段已保留。确认后隐藏 diff 和编辑器高亮。`
+                                    : "确认后隐藏 diff 和编辑器高亮，修改会保留在项目中。"}
+                                </span>
                               </div>
                               <button type="button" className="primary-button" onClick={handleAcceptCodexChanges}>
                                 <CheckCircle2 size={14} />
@@ -6130,9 +6347,16 @@ export function App() {
                             </div>
                             <CodexDiffView
                               summary={diffSummary}
+                              acceptedHunkKeys={acceptedCodexHunkKeys}
                               onOpenTarget={(file, line) => void runSafely(() => handleOpenDiffTarget(file, line))}
                               onCopyDiff={(text, label) => void runSafely(() => handleCopyDiffText(text, label))}
+                              onAcceptHunk={handleAcceptCodexHunk}
+                              onReviseHunk={handleReviseCodexHunk}
+                              onClearAcceptedHunks={handleShowAcceptedCodexHunks}
                               onRevertFile={(file) => void runSafely(() => handleRevertCodexFile(file))}
+                              onRevertHunk={(file, hunk, hunkIndex) =>
+                                void runSafely(() => handleRevertCodexHunk(file, hunk, hunkIndex))
+                              }
                             />
                           </>
                         ) : codexAnswer ? (
@@ -6157,6 +6381,15 @@ export function App() {
                                 >
                                   <Pencil size={13} />
                                   <span>转为修改</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={handleInsertCodexAnswerAsReviewComment}
+                                  title="把回答插入为 REVIEW 批注"
+                                  aria-label="把回答插入为 REVIEW 批注"
+                                >
+                                  <MessageSquareText size={13} />
+                                  <span>转为批注</span>
                                 </button>
                               </div>
                             </div>
@@ -6236,7 +6469,7 @@ export function App() {
                               title={formatCodexContextHint(pinnedCodexContext)}
                             >
                               <LocateFixed size={12} />
-                              <span>{pinnedCodexContext.selectedText.trim() ? "选区" : "光标"}</span>
+                              <span>{codexContextKindLabel(pinnedCodexContext)}</span>
                               <small>{shortFileName(pinnedCodexContext.file)}:{pinnedCodexContext.cursorLine}</small>
                             </button>
                             <button
@@ -6318,6 +6551,24 @@ export function App() {
                             </span>
                           </span>
                         )}
+                      </div>
+                    )}
+                    {shouldShowCodexPreflight && (
+                      <div className="codex-preflight-strip" aria-label="Codex 运行前预检">
+                        <span className="codex-preflight-label">预检</span>
+                        {codexPreflightItems.map((item) => (
+                          <span
+                            className={`codex-preflight-item ${
+                              item.tone ? `codex-preflight-item-${item.tone}` : ""
+                            }`}
+                            key={item.key}
+                            title={`${item.label}：${item.detail}`}
+                          >
+                            <strong>{item.label}</strong>
+                            <small>{item.detail}</small>
+                          </span>
+                        ))}
+                        <span className="codex-preflight-mode">执行会修改文件；问只读分析</span>
                       </div>
                     )}
 	                    <textarea
@@ -7435,11 +7686,13 @@ export function App() {
               </div>
             </div>
             {activeAsset ? (
-              <AssetPreview
-                asset={activeAsset}
-                onInsertSnippet={handleInsertSnippetFromAsset}
-                onStatus={setStatus}
-              />
+              <Suspense fallback={<AssetPreviewLoadingState />}>
+                <AssetPreview
+                  asset={activeAsset}
+                  onInsertSnippet={handleInsertSnippetFromAsset}
+                  onStatus={setStatus}
+                />
+              </Suspense>
             ) : (
               <div className="monaco-editor-host">
                 <Editor
@@ -7695,23 +7948,52 @@ export function App() {
                     void runSafely(() => handleExplainCompileWithCodex(compileResult))
                   }
                 />
+              ) : pdfPath ? (
+                <Suspense fallback={<PdfPreviewLoadingState />}>
+                  <PdfPreview
+                    projectRoot={project?.root}
+                    pdfPath={pdfPath}
+                    revision={pdfRevision}
+                    syncTarget={pdfSyncTarget}
+                    onSourceSync={(page, x, y) =>
+                      void runSafely(() => handleSyncSourceFromPdf(page, x, y))
+                    }
+                    onStatus={setStatus}
+                  />
+                </Suspense>
               ) : (
-                <PdfPreview
-                  projectRoot={project?.root}
-                  pdfPath={pdfPath}
-                  revision={pdfRevision}
-                  syncTarget={pdfSyncTarget}
-                  onSourceSync={(page, x, y) =>
-                    void runSafely(() => handleSyncSourceFromPdf(page, x, y))
-                  }
-                  onStatus={setStatus}
-                />
+                <PdfPreviewEmptyState />
               )}
             </>
           )}
           </aside>
         )}
       </main>
+    </div>
+  );
+}
+
+function PdfPreviewEmptyState() {
+  return (
+    <div className="empty-preview">
+      <strong>暂无 PDF</strong>
+      <span>点击“编译”后会在这里预览生成的文档。</span>
+    </div>
+  );
+}
+
+function PdfPreviewLoadingState() {
+  return (
+    <div className="empty-preview">
+      <strong>正在加载 PDF 预览</strong>
+    </div>
+  );
+}
+
+function AssetPreviewLoadingState() {
+  return (
+    <div className="empty-preview">
+      <strong>正在加载资源预览</strong>
     </div>
   );
 }
@@ -8162,219 +8444,6 @@ function CodexProgressView({
   );
 }
 
-function CodexDiffView({
-  summary,
-  onOpenTarget,
-  onCopyDiff,
-  onRevertFile,
-  summaryHint = "可用上方撤回按钮恢复本次修改。",
-  emptyText = "没有文件变化。",
-}: {
-  summary: DiffSummary;
-  onOpenTarget: (file: string, line?: number) => void;
-  onCopyDiff?: (text: string, label: string) => void;
-  onRevertFile?: (file: string) => void;
-  summaryHint?: string;
-  emptyText?: string;
-}) {
-  const files = parseUnifiedDiff(summary.unifiedDiff);
-  const fullDiffText = summary.unifiedDiff || summary.changedFiles.join("\n");
-  const firstTarget = firstNavigableDiffTarget(files);
-  if (!summary.changedFiles.length) {
-    return <div className="empty-log">{emptyText}</div>;
-  }
-  if (!files.length) {
-    return (
-      <div className="codex-diff-view">
-        <div className="codex-diff-summary">
-          <div className="codex-diff-summary-main">
-            <div>
-              <strong>{summary.changedFiles.length} 个文件发生变化</strong>
-              {summary.promptPreview && <span className="codex-diff-prompt">指令：{summary.promptPreview}</span>}
-              {summary.finalMessage && <span className="codex-diff-message">Codex 说明：{summary.finalMessage}</span>}
-              <span>这些文件可能是二进制或非 UTF-8 内容。</span>
-            </div>
-            {onCopyDiff && (
-              <button
-                type="button"
-                className="codex-diff-copy"
-                onClick={() => onCopyDiff(fullDiffText, "本次 diff")}
-                title="复制本次 diff"
-                aria-label="复制本次 diff"
-              >
-                <Clipboard size={13} />
-                <span>复制 diff</span>
-              </button>
-            )}
-          </div>
-        </div>
-        <pre>{summary.unifiedDiff || summary.changedFiles.join("\n")}</pre>
-      </div>
-    );
-  }
-  return (
-    <div className="codex-diff-view">
-      <div className="codex-diff-summary">
-        <div className="codex-diff-summary-main">
-          <div>
-            <strong>{summary.changedFiles.length} 个文件发生变化</strong>
-            {summary.promptPreview && <span className="codex-diff-prompt">指令：{summary.promptPreview}</span>}
-            {summary.finalMessage && <span className="codex-diff-message">Codex 说明：{summary.finalMessage}</span>}
-            <span>{summaryHint}</span>
-          </div>
-          <div className="codex-diff-summary-actions">
-            {firstTarget && (
-              <button
-                type="button"
-                className="codex-diff-copy codex-diff-open-first"
-                onClick={() => onOpenTarget(firstTarget.file, firstTarget.line)}
-                title="在编辑器中打开第一处 Codex 修改"
-                aria-label="打开第一处 Codex 修改"
-              >
-                <LocateFixed size={13} />
-                <span>定位首处</span>
-              </button>
-            )}
-            {onCopyDiff && (
-              <button
-                type="button"
-                className="codex-diff-copy"
-                onClick={() => onCopyDiff(fullDiffText, "本次 diff")}
-                title="复制本次 diff"
-                aria-label="复制本次 diff"
-              >
-                <Clipboard size={13} />
-                <span>复制 diff</span>
-              </button>
-            )}
-          </div>
-        </div>
-      </div>
-      {files.map((file) => (
-        <section className="codex-diff-file" key={file.file}>
-          <div className="codex-diff-file-header">
-            <button
-              type="button"
-              className="codex-diff-file-title"
-              onClick={() => onOpenTarget(file.file)}
-              title={`打开 ${file.file}`}
-            >
-              {file.file}
-            </button>
-            <div className="codex-diff-file-actions">
-              {onCopyDiff && (
-                <button
-                  type="button"
-                  className="codex-diff-copy codex-diff-file-copy"
-                  onClick={() => onCopyDiff(formatParsedDiffFile(file), `${file.file} diff`)}
-                  title={`复制 ${file.file} 的 diff`}
-                  aria-label={`复制 ${file.file} 的 diff`}
-                >
-                  <Clipboard size={13} />
-                  <span>复制</span>
-                </button>
-              )}
-              {summary.canRevert && onRevertFile && (
-                <button
-                  type="button"
-                  className="codex-diff-file-revert"
-                  onClick={() => onRevertFile(file.file)}
-                  title={`仅撤回 ${file.file} 的 Codex 修改`}
-                  aria-label={`仅撤回 ${file.file} 的 Codex 修改`}
-                >
-                  <Undo2 size={13} />
-                  <span>撤回此文件</span>
-                </button>
-              )}
-            </div>
-          </div>
-          <div className="codex-diff-lines">
-            {file.lines.map((line, index) => {
-              const targetLine = diffTargetLine(line);
-              return (
-                <button
-                  type="button"
-                  className={`codex-diff-line codex-diff-${line.kind}`}
-                  key={`${file.file}-${index}`}
-                  onClick={() => onOpenTarget(file.file, targetLine)}
-                  disabled={!targetLine}
-                  title={targetLine ? `跳转到 ${file.file}:${targetLine}` : `打开 ${file.file}`}
-                >
-                  <span className="codex-diff-number codex-diff-old-line">{formatDiffLineNumber(line.oldLine)}</span>
-                  <span className="codex-diff-number codex-diff-new-line">{formatDiffLineNumber(line.newLine)}</span>
-                  <span className="codex-diff-prefix">{diffPrefix(line.kind)}</span>
-                  <code>{line.content || " "}</code>
-                </button>
-              );
-            })}
-          </div>
-        </section>
-      ))}
-    </div>
-  );
-}
-
-function firstNavigableDiffTarget(files: ParsedDiffFile[]) {
-  for (const file of files) {
-    for (const line of file.lines) {
-      if (line.kind === "meta") continue;
-      const targetLine = diffTargetLine(line);
-      if (targetLine) return { file: file.file, line: targetLine };
-    }
-  }
-  return null;
-}
-
-function languageForPath(path: string) {
-  const extension = path.split(".").pop()?.toLowerCase();
-  if (extension === "bib") return "bibtex";
-  if (extension === "json") return "json";
-  if (extension === "md") return "markdown";
-  return "latex";
-}
-
-function configureMonacoLatexTheme(monacoApi: MonacoApi) {
-  if (!isMonacoLatexConfigured) {
-    if (!monacoApi.languages.getLanguages().some((language) => language.id === "latex")) {
-      monacoApi.languages.register({ id: "latex" });
-    }
-    monacoApi.languages.setMonarchTokensProvider("latex", {
-      tokenizer: {
-        root: [
-          [/%.*$/, "comment.latex"],
-          [/\\[a-zA-Z@]+\*?/, "keyword.latex"],
-          [/\\./, "keyword.latex"],
-          [/\$[^$]*\$/, "string.latex"],
-          [/[{}[\]()]/, "delimiter.latex"],
-          [/[&_^#~]/, "operator.latex"],
-        ],
-      },
-    });
-    isMonacoLatexConfigured = true;
-  }
-  monacoApi.editor.defineTheme(MONACO_LATEX_THEME, {
-    base: "vs",
-    inherit: true,
-    rules: [
-      { token: "keyword.latex", foreground: "1f6fb2", fontStyle: "bold" },
-      { token: "comment.latex", foreground: "5f8b67", fontStyle: "italic" },
-      { token: "string.latex", foreground: "9a5b00" },
-      { token: "delimiter.latex", foreground: "7a4cb0" },
-      { token: "operator.latex", foreground: "a33b3b" },
-    ],
-    colors: {
-      "editor.background": "#ffffff",
-      "editor.foreground": "#20262d",
-      "editorLineNumber.foreground": "#8d98a5",
-      "editorLineNumber.activeForeground": "#2c6f9f",
-      "editor.selectionBackground": "#cfe8ff",
-      "editor.inactiveSelectionBackground": "#e6f2fc",
-      "editorCursor.foreground": "#1f6fb2",
-      "editorGutter.background": "#ffffff",
-    },
-  });
-}
-
 function isTextPath(path: string) {
   const extension = path.split(".").pop()?.toLowerCase() ?? "";
   return textExtensions.has(extension);
@@ -8652,44 +8721,6 @@ function truncateLatexSummaryText(value: string, maxLength: number) {
   return value.length > maxLength ? `${value.slice(0, Math.max(0, maxLength - 1))}…` : value;
 }
 
-function codexContextLineRange(context: CodexEditorContext) {
-  if (context.selectedText.trim() && context.selectionStartLine && context.selectionEndLine) {
-    return {
-      startLine: Math.min(context.selectionStartLine, context.selectionEndLine),
-      endLine: Math.max(context.selectionStartLine, context.selectionEndLine),
-    };
-  }
-  if (context.activeSectionSource) {
-    return {
-      startLine: context.activeSectionSource.startLine,
-      endLine: context.activeSectionSource.endLine,
-    };
-  }
-  return {
-    startLine: context.nearbyStartLine,
-    endLine: context.nearbyEndLine,
-  };
-}
-
-function codexCitationSource(context: CodexEditorContext) {
-  if (context.selectedText.trim()) {
-    return {
-      text: context.selectedText,
-      startLine: context.selectionStartLine ?? 1,
-    };
-  }
-  if (context.activeSectionSource?.text.trim()) {
-    return {
-      text: context.activeSectionSource.text,
-      startLine: context.activeSectionSource.startLine,
-    };
-  }
-  return {
-    text: context.nearbyText,
-    startLine: context.nearbyStartLine,
-  };
-}
-
 function citationKeysInLatexSource(source: string, startLine: number) {
   const seen = new Set<string>();
   const keys: string[] = [];
@@ -8754,20 +8785,6 @@ function readEditorActiveSectionContext(
     text: truncated ? rawText.slice(0, MAX_CODEX_ACTIVE_SECTION_CONTEXT) : rawText,
     truncated,
   };
-}
-
-function formatCodexContextHint(context: CodexEditorContext | null) {
-  if (!context) return "";
-  const section = context.activeSection?.title ? ` · ${outlineKindLabel(context.activeSection.kind)} ${context.activeSection.title}` : "";
-  if (context.selectedText.trim()) {
-    const range =
-      context.selectionStartLine === context.selectionEndLine
-        ? `${context.selectionStartLine}`
-        : `${context.selectionStartLine}-${context.selectionEndLine}`;
-    const suffix = context.truncated ? "+" : "";
-    return `${context.file}:${range} · 选区 ${context.selectedCharCount}${suffix} 字${section}`;
-  }
-  return `${context.file}:${context.cursorLine} · 当前光标${section}`;
 }
 
 function buildCodexProjectContext(
@@ -10229,6 +10246,38 @@ function uniqueTextPaths(paths: string[]) {
   return result;
 }
 
+function existingProjectTextPaths(paths: string[], projectFiles: string[]) {
+  const projectFileSet = new Set(projectFiles);
+  return uniqueTextPaths(paths).filter((path) => projectFileSet.has(path));
+}
+
+function codexAllowedFilesForDiagnostics(
+  project: ProjectSummary,
+  diagnostics: Diagnostic[],
+  projectFiles: string[],
+) {
+  return existingProjectTextPaths(
+    diagnostics
+      .map((diagnostic) => (diagnostic.file ? normalizeDiagnosticPath(diagnostic.file, project.root) : ""))
+      .filter(Boolean),
+    projectFiles,
+  );
+}
+
+function codexAllowedFilesForTodos(todos: ProjectTodo[], projectFiles: string[]) {
+  return existingProjectTextPaths(todos.map((todo) => todo.file), projectFiles);
+}
+
+function codexAllowedFilesForReferenceIssues(
+  issues: ProjectReferenceIssue[],
+  projectFiles: string[],
+  bibFiles: string[],
+) {
+  const issueFiles = issues.map((issue) => issue.file);
+  const needsBib = issues.some((issue) => issue.kind === "citation");
+  return existingProjectTextPaths([...issueFiles, ...(needsBib ? bibFiles : [])], projectFiles);
+}
+
 function loadProjectEditorSession(projectRoot: string): ProjectEditorSession {
   try {
     const raw = window.localStorage.getItem(projectEditorSessionKey(projectRoot));
@@ -10839,11 +10888,12 @@ function codexEditorDecorationsForPath(
   summary: DiffSummary,
   path: string,
   lineCount: number,
+  acceptedHunkKeys: string[] = [],
 ): MonacoEditor.IModelDeltaDecoration[] {
   const maxLine = Math.max(1, lineCount);
   const fileDiff = parseUnifiedDiff(summary.unifiedDiff).find((file) => file.file === path);
   if (!fileDiff) return [];
-  return codexChangedLineEntries(fileDiff)
+  return codexChangedLineEntries(fileDiff, new Set(acceptedHunkKeys))
     .map(({ kind, lineNumber }): MonacoEditor.IModelDeltaDecoration => {
       const safeLineNumber = clamp(lineNumber, 1, maxLine);
       const isAddition = kind === "add";
@@ -10902,24 +10952,54 @@ function reviewEditorDecorationsForModel(
   return decorations;
 }
 
-function codexChangedLineNumbersForPath(summary: DiffSummary, path: string) {
+function codexChangedLineNumbersForPath(summary: DiffSummary, path: string, acceptedHunkKeys: string[] = []) {
   const fileDiff = parseUnifiedDiff(summary.unifiedDiff).find((file) => file.file === path);
   if (!fileDiff) return [];
-  return Array.from(new Set(codexChangedLineEntries(fileDiff).map((entry) => entry.lineNumber))).sort(
+  return Array.from(new Set(codexChangedLineEntries(fileDiff, new Set(acceptedHunkKeys)).map((entry) => entry.lineNumber))).sort(
     (left, right) => left - right,
   );
 }
 
-function codexChangedLineEntries(fileDiff: ParsedDiffFile) {
-  return fileDiff.lines
-    .map((line, index) => {
-      if (line.kind !== "add" && line.kind !== "remove") return null;
-      return {
-        kind: line.kind,
-        lineNumber: line.newLine ?? nearestDiffLine(fileDiff.lines, index) ?? 1,
-      };
-    })
-    .filter((entry): entry is { kind: "add" | "remove"; lineNumber: number } => Boolean(entry));
+function codexChangedLineEntries(fileDiff: ParsedDiffFile, acceptedHunkKeys: Set<string> = new Set()) {
+  return parsedDiffHunks(fileDiff).flatMap((hunk) => {
+    if (acceptedHunkKeys.has(codexDiffHunkKey(fileDiff.file, hunk))) return [];
+    return hunk.lines
+      .map((line, index) => {
+        if (line.kind !== "add" && line.kind !== "remove") return null;
+        return {
+          kind: line.kind,
+          lineNumber: line.newLine ?? nearestDiffLine(hunk.lines, index) ?? line.oldLine ?? 1,
+        };
+      })
+      .filter((entry): entry is { kind: "add" | "remove"; lineNumber: number } => Boolean(entry));
+  });
+}
+
+function codexEditorContextFromHunk(file: string, hunk: ParsedDiffHunk): CodexEditorContext {
+  const currentLines = hunk.lines.filter((line) => line.kind !== "remove").map((line) => line.content);
+  const fallbackLines = hunk.lines.filter((line) => line.kind !== "add").map((line) => line.content);
+  const contextLines = currentLines.length ? currentLines : fallbackLines;
+  const selectedText = contextLines.join("\n");
+  const nearbyText = contextLines.join("\n");
+  const cursorLine = Math.max(1, hunk.newStart ?? hunk.oldStart ?? 1);
+  const selectionEndLine = selectedText
+    ? cursorLine + Math.max(0, contextLines.length - 1)
+    : undefined;
+  return {
+    source: "diff-hunk",
+    file,
+    cursorLine,
+    cursorColumn: 1,
+    selectedText,
+    selectedCharCount: selectedText.length,
+    selectionStartLine: selectedText ? cursorLine : undefined,
+    selectionEndLine,
+    truncated: false,
+    nearbyStartLine: cursorLine,
+    nearbyEndLine: cursorLine + Math.max(0, contextLines.length - 1),
+    nearbyText,
+    nearbyTruncated: false,
+  };
 }
 
 function nearestDiffLine(lines: ParsedDiffLine[], index: number) {

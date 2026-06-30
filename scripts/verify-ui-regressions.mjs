@@ -5,12 +5,20 @@ const styles = readFileSync(new URL("../src/styles.css", import.meta.url), "utf8
 const backend = readFileSync(new URL("../src-tauri/src/main.rs", import.meta.url), "utf8");
 const packageJson = readFileSync(new URL("../package.json", import.meta.url), "utf8");
 const editorLogic = readFileSync(new URL("../src/lib/editorLogic.ts", import.meta.url), "utf8");
+const codexContext = readFileSync(new URL("../src/lib/codexContext.ts", import.meta.url), "utf8");
+const monacoLatex = readFileSync(new URL("../src/lib/monacoLatex.ts", import.meta.url), "utf8");
+const types = readFileSync(new URL("../src/types.ts", import.meta.url), "utf8");
 const editorLogicTests = readFileSync(new URL("./test-editor-logic.mjs", import.meta.url), "utf8");
 const tauriConfig = readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8");
+const viteConfig = readFileSync(new URL("../vite.config.ts", import.meta.url), "utf8");
 const macInfoPlist = readFileSync(new URL("../src-tauri/Info.plist", import.meta.url), "utf8");
 const tauri = readFileSync(new URL("../src/tauri.ts", import.meta.url), "utf8");
 const pdfPreview = readFileSync(new URL("../src/components/PdfPreview.tsx", import.meta.url), "utf8");
 const fileTreeNode = readFileSync(new URL("../src/components/FileTreeNode.tsx", import.meta.url), "utf8");
+const codexDiffView = readFileSync(new URL("../src/components/CodexDiffView.tsx", import.meta.url), "utf8");
+const appAndCodexDiff = `${app}\n${codexDiffView}`;
+const appAndCodexContext = `${app}\n${codexContext}`;
+const appCodexDiffAndContext = `${appAndCodexDiff}\n${codexContext}`;
 
 const checks = [];
 
@@ -159,6 +167,98 @@ addCheck(
       "editor logic tests passed",
     ]) &&
     packageJson.includes('"test:logic": "node scripts/test-editor-logic.mjs"'),
+);
+
+addCheck(
+  "Codex editor context display rules live outside the main App component",
+  includesAll(app, [
+    'from "./lib/codexContext"',
+    "codexContextKindLabel",
+    "codexContextLineRange",
+    "codexCitationSource",
+    "formatCodexContextHint",
+    "CodexEditorContext,",
+  ]) &&
+    includesAll(types, [
+      "export type CodexEditorContext",
+      'source?: "editor" | "diff-hunk"',
+      "activeSectionSource?:",
+      "nearbyText: string",
+    ]) &&
+    includesAll(codexContext, [
+      "export function formatCodexContextHint",
+      "export function codexContextKindLabel",
+      "export function codexContextLineRange",
+      "export function codexContextSource",
+      "Codex 片段",
+      "锁定片段",
+    ]) &&
+    includesAll(editorLogicTests, [
+      "codexContext.formatCodexContextHint",
+      "codexContext.codexContextKindLabel",
+      "codexContext.codexContextLineRange",
+      "codexContext.codexContextSource",
+    ]) &&
+    !app.includes("function formatCodexContextHint") &&
+    !app.includes("function codexContextKindLabel"),
+);
+
+addCheck(
+  "Monaco LaTeX language and theme live outside the main App component",
+  includesAll(app, [
+    'from "./lib/monacoLatex"',
+    "configureMonacoLatexTheme",
+    "languageForPath",
+    "MONACO_LATEX_THEME",
+    "type MonacoApi",
+  ]) &&
+    includesAll(monacoLatex, [
+      "export type MonacoApi",
+      "export const MONACO_LATEX_THEME",
+      "export function languageForPath",
+      "export function configureMonacoLatexTheme",
+      'monacoApi.languages.setMonarchTokensProvider("latex"',
+      "keyword.latex",
+      "comment.latex",
+    ]) &&
+    !app.includes("setMonarchTokensProvider(\"latex\""),
+);
+
+addCheck(
+  "Vite splits heavy editor and PDF libraries away from the main app chunk",
+  includesAll(viteConfig, [
+    "manualChunks(id)",
+    'id.includes("pdfjs-dist")',
+    'return "pdf-viewer"',
+    'id.includes("monaco-editor")',
+    'id.includes("@monaco-editor")',
+    'return "editor-core"',
+    'return "react-vendor"',
+  ]),
+);
+
+addCheck(
+  "PDF preview engine loads only when a compiled PDF is available",
+  includesAll(app, [
+    "const PdfPreview = lazy(() =>",
+    'import("./components/PdfPreview")',
+    "<Suspense fallback={<PdfPreviewLoadingState />}>",
+    ") : pdfPath ? (",
+    "<PdfPreviewEmptyState />",
+  ]) &&
+    !app.includes('import { PdfPreview } from "./components/PdfPreview"'),
+);
+
+addCheck(
+  "asset preview loads only when a project asset is opened",
+  includesAll(app, [
+    "const AssetPreview = lazy(() =>",
+    'import("./components/AssetPreview")',
+    "<Suspense fallback={<AssetPreviewLoadingState />}>",
+    "activeAsset ? (",
+    "正在加载资源预览",
+  ]) &&
+    !app.includes('import { AssetPreview } from "./components/AssetPreview"'),
 );
 
 addCheck(
@@ -321,6 +421,10 @@ addCheck(
     "buildCompileExplainPrompt",
     "buildDiagnosticFixPrompt",
     "buildDiagnosticExplainPrompt",
+    "codexAllowedFilesForDiagnostics(project, result.diagnostics, allProjectFiles)",
+    "codexAllowedFilesForDiagnostics(project, [diagnostic], allProjectFiles)",
+    "编译诊断相关文件",
+    "当前诊断文件",
     "runCodexAskPrompt(await prepareCodexPrompt(prompt), prompt)",
     "onFixDiagnosticWithCodex",
     "onExplainDiagnosticWithCodex",
@@ -536,12 +640,18 @@ addCheck(
     "正在导出项目源码",
     "项目源码已导出：",
   ]) &&
-    includesAll(tauri, ["exportProjectZip", 'invoke<string | null>("export_project_zip"']) &&
+    includesAll(tauri, [
+      'import { open, save } from "@tauri-apps/plugin-dialog"',
+      "exportProjectZip",
+      "save({",
+      'invoke<string>("export_project_zip"',
+      "targetPath",
+    ]) &&
     includesAll(backend, [
       "export_project_zip",
       "export_project_zip_to_path",
-      "copy_project_sources_for_export",
-      "prepares_project_source_export_without_build_artifacts",
+      "write_project_zip_archive",
+      "exports_and_imports_project_zip_without_external_commands",
     ]) &&
     hasCssBlock(".project-utility-row", ["border-top: 1px solid #e8eef4;", "grid-template-columns: auto;"]),
 );
@@ -743,8 +853,10 @@ addCheck(
 
 addCheck(
   "Codex no-change runs do not show empty diffs or trigger auto-compile",
-  includesAll(app, [
-    "setDiffSummary(summary.changedFiles.length ? summary : null)",
+  includesAll(appAndCodexDiff, [
+    "const hasScopeRevertedFiles = Boolean(summary.scopeRevertedFiles?.length);",
+    "setDiffSummary(summary.changedFiles.length || hasScopeRevertedFiles ? summary : null)",
+    "if (!scopeRevertedFiles.length)",
     "Codex 已完成，没有文件变化。",
   ]) &&
     !app.includes('createAutomaticHistorySnapshot("Codex 修改前")') &&
@@ -769,7 +881,7 @@ addCheck(
     "function clearStaleCompileFailure()",
     "setCompileResult((current) => (current && !current.success ? null : current));",
     "autoCompile: false",
-    "const summary = scopeResult.summary;",
+    "const summary = rawSummary;",
     "markSourceEdited();",
     "Codex 修改已应用并重新编译完成。",
     "Codex 修改已应用，但重新编译仍有错误。",
@@ -905,12 +1017,17 @@ addCheck(
 
 addCheck(
   "Codex changed lines are highlighted and navigable inside the LaTeX editor",
-  includesAll(app, [
+  includesAll(appAndCodexDiff, [
     "codexDecorationCollectionRef",
     "createDecorationsCollection()",
     "codexEditorDecorationsForPath",
     "codexChangedLineNumbersForPath",
     "codexChangedLineEntries",
+    "acceptedCodexHunkKeys",
+    "codexChangedLineNumbersForPath(diffSummary, activePath, acceptedCodexHunkKeys)",
+    "codexEditorDecorationsForPath(monacoApi, diffSummary, activePath, model.getLineCount(), acceptedCodexHunkKeys)",
+    "parsedDiffHunks(fileDiff).flatMap",
+    "acceptedHunkKeys.has(codexDiffHunkKey(fileDiff.file, hunk))",
     "activeCodexChangeLines",
     "handleJumpToCodexChange",
     "diffTargetLine(line)",
@@ -949,7 +1066,7 @@ addCheck(
 
 addCheck(
   "Codex history keeps prompt previews and final messages for traceable natural-language edits",
-  includesAll(app, [
+  includesAll(appAndCodexDiff, [
     "item.promptPreview",
     "item.finalMessage",
     "handleReuseCodexHistoryPrompt",
@@ -988,7 +1105,8 @@ addCheck(
 
 addCheck(
   "Codex diff review supports copying full and per-file diffs",
-  includesAll(app, [
+  includesAll(appAndCodexDiff, [
+    'import { CodexDiffView } from "./components/CodexDiffView"',
     "handleCopyDiffText",
     "navigator.clipboard.writeText(content)",
     "onCopyDiff={(text, label) => void runSafely(() => handleCopyDiffText(text, label))}",
@@ -1008,12 +1126,53 @@ addCheck(
 );
 
 addCheck(
+  "Codex diff review groups changes into copyable hunks",
+  includesAll(codexDiffView, [
+    "parsedDiffHunks(file).map",
+    "CodexDiffHunkView",
+    "ParsedDiffHunk",
+    "formatParsedDiffHunk(file, hunk)",
+    "firstNavigableHunkLine",
+    "片段 {hunkIndex + 1}",
+    "复制这个修改片段",
+    "复制片段",
+    "定位这个修改片段",
+    "codex-diff-hunk-header",
+    "codex-diff-hunk-stats",
+    "codex-diff-hunk-add",
+    "codex-diff-hunk-remove",
+    "codexDiffHunkKey(file.file, hunk)",
+    "onAcceptHunk(file.file, hunk, hunkIndex)",
+    "onReviseHunk(file.file, hunk, hunkIndex)",
+    "保留这个修改片段",
+    "保留片段",
+    "继续修改这个片段",
+    "继续修改",
+  ]) &&
+    includesAll(editorLogic, [
+      "export type ParsedDiffHunk",
+      "export function parsedDiffHunks",
+      "export function formatParsedDiffHunk",
+      "export function codexDiffHunkKey",
+      "export function codexDiffHunkReviewStats",
+    ]) &&
+    editorLogicTests.includes("logic.parsedDiffHunks(files[0])") &&
+    editorLogicTests.includes("logic.codexDiffHunkKey(files[0].file, hunks[0])") &&
+    editorLogicTests.includes("logic.codexDiffHunkReviewStats(diff)") &&
+    hasCssBlock(".codex-diff-hunk-header", ["grid-template-columns: minmax(0, 1fr) auto auto;"]) &&
+    hasCssBlock(".codex-diff-hunk-title", ["display: grid;", "text-align: left;"]) &&
+    hasCssBlock(".codex-diff-hunk-stats", ["display: inline-flex;", "gap: 4px;"]) &&
+    hasCssBlock(".codex-diff-hunk-action", ["font-size: 11px;", "height: auto;"]) &&
+    hasCssBlock(".codex-diff-hunk-revise", ["background: #eef6ff;", "color: #255f9f;"]) &&
+    hasCssBlock(".codex-diff-hunk-accept", ["background: #eef9f1;", "color: #1f6f44;"]),
+);
+
+addCheck(
   "Codex diff review can jump directly to the first changed source line",
-  includesAll(app, [
-    "function firstNavigableDiffTarget",
-    "const firstTarget = firstNavigableDiffTarget(files)",
-    "line.kind === \"meta\"",
-    "diffTargetLine(line)",
+  includesAll(codexDiffView, [
+    "function firstNavigableDiffHunkTarget",
+    "const firstTarget = firstNavigableDiffHunkTarget(diffFiles)",
+    "firstNavigableHunkLine(hunk)",
     "onOpenTarget(firstTarget.file, firstTarget.line)",
     "className=\"codex-diff-copy codex-diff-open-first\"",
     "在编辑器中打开第一处 Codex 修改",
@@ -1023,20 +1182,50 @@ addCheck(
 
 addCheck(
   "Codex changes can be accepted and the diff workspace returns to its initial state",
-  includesAll(app, [
+  includesAll(appCodexDiffAndContext, [
     "handleAcceptCodexChanges",
     "setDiffSummary(null)",
     "setCodexEvents([])",
     "setCodexAnswer(\"\")",
     "setCodexPrompt(\"\")",
+    "setAcceptedCodexHunkKeys([])",
     "codexDecorationCollectionRef.current?.clear()",
+    "acceptedHunkKeys={acceptedCodexHunkKeys}",
+    "handleAcceptCodexHunk",
+    "handleReviseCodexHunk",
+    "codexEditorContextFromHunk(file, hunk)",
+    "function codexEditorContextFromHunk",
+    "setPinnedCodexContext(context)",
+    "formatParsedDiffHunk({ file, lines: hunk.lines }, hunk)",
+    "请基于已锁定的 Codex 修改片段继续修改 @${file}。",
+    "你想让 Codex 怎么处理：",
+    "source: \"diff-hunk\"",
+    "Codex 片段",
+    "setIsCodexContextOnlyEnabled(true)",
+    "已锁定 ${file} 的片段 ${hunkIndex + 1}，在输入框末尾写清要求后执行。",
+    "onReviseHunk={handleReviseCodexHunk}",
+    "handleShowAcceptedCodexHunks",
+    "onClearAcceptedHunks={handleShowAcceptedCodexHunks}",
+    "codexDiffHunkReviewStats(diffSummary.unifiedDiff, acceptedCodexHunkKeys)",
+    "const codexReviewBadgeCount",
+    "<small title={codexReviewBadgeTitle}>{codexReviewBadgeCount}</small>",
+    "codexReviewStats.pendingHunks > 0",
+    "`${codexReviewStats.pendingHunks} 个片段待审`",
+    "所有片段已保留",
+    "已保留 {acceptedHunkCount} 个片段",
+    "显示全部",
+    "所有片段都已保留",
+    "codex-diff-reviewed-note",
+    "codex-diff-all-reviewed",
     "确认修改",
     "确认后隐藏 diff 和编辑器高亮",
     "codex-accept-row",
   ]) &&
     hasCssBlock(".codex-accept-row", ["background: #eef9f1;", "grid-template-columns: minmax(0, 1fr) auto;"]) &&
     hasCssBlock(".codex-accept-row button", ["background: #237247;", "color: #ffffff;"]) &&
-    hasCssBlock(".codex-accept-row button span", ["color: #ffffff;", "font-weight: 720;"]),
+    hasCssBlock(".codex-accept-row button span", ["color: #ffffff;", "font-weight: 720;"]) &&
+    hasCssBlock(".codex-diff-reviewed-note", ["color: #2e6a45 !important;", "font-weight: 680;"]) &&
+    hasCssBlock(".codex-diff-all-reviewed", ["background: #f4fbf6;", "text-align: center;"]),
 );
 
 addCheck(
@@ -1060,13 +1249,17 @@ addCheck(
 
 addCheck(
   "Codex revert supports whole-run and single-file recovery snapshots",
-  includesAll(app, [
+  includesAll(appAndCodexDiff, [
     "isCodexRevertConfirmVisible",
     "setIsCodexRevertConfirmVisible(true)",
     "handleConfirmRevertCodex",
     "handleRevertCodexFile",
+    "handleRevertCodexHunk",
+    "revertParsedDiffHunkInContent(currentContent, hunk)",
+    "getCodexDiff(project.root, runId)",
     'createProjectHistorySnapshot(project.root, "撤回 Codex 修改前")',
     "createProjectHistorySnapshot(project.root, `撤回 Codex 对 ${file} 的修改前`)",
+    "createProjectHistorySnapshot(project.root, `撤回 Codex 对 ${file} 的片段 ${hunkIndex + 1} 前`)",
     "revertCodexRun(project.root, runId)",
     "revertCodexFile(project.root, runId, file)",
     "setDiffSummary(nextSummary.changedFiles.length ? nextSummary : null)",
@@ -1074,10 +1267,19 @@ addCheck(
     "codex-revert-warning",
     "codex-revert-danger",
     "codex-diff-file-revert",
+    "codex-diff-hunk-revert",
     "撤回此文件",
+    "撤回片段",
+    "仅撤回这个修改片段",
     "确认撤回",
     "dirtyTabCount",
   ]) &&
+    includesAll(editorLogic, [
+      "export function revertParsedDiffHunkInContent",
+      "locateDiffHunkInLines",
+      "无法在当前文件中定位这个 Codex 修改片段",
+    ]) &&
+    editorLogicTests.includes("logic.revertParsedDiffHunkInContent") &&
     includesAll(tauri, ['revert_codex_file", { projectRoot, runId, path }']) &&
     includesAll(backend, [
       "fn revert_codex_file(",
@@ -1094,7 +1296,8 @@ addCheck(
     hasCssBlock(".codex-revert-actions", ["justify-content: flex-end", "gap: 7px"]) &&
     hasCssBlock(".codex-revert-danger", ["background: #a83b32", "color: #ffffff"]) &&
     hasCssBlock(".codex-diff-file-header", ["grid-template-columns: minmax(0, 1fr) auto;"]) &&
-    hasCssBlock(".codex-diff-file-revert", ["background: #fff8eb;", "color: #765415;"]),
+    hasCssBlock(".codex-diff-file-revert", ["background: #fff8eb;", "color: #765415;"]) &&
+    hasCssBlock(".codex-diff-hunk-revert", ["background: #fff8eb;", "color: #765415;"]),
 );
 
 addCheck(
@@ -1356,7 +1559,7 @@ addCheck(
 
 addCheck(
   "Codex cursor context includes active section and nearby source when nothing is selected",
-  includesAll(app, [
+  includesAll(appAndCodexContext, [
     "MAX_CODEX_ACTIVE_SECTION_CONTEXT",
     "MAX_CODEX_NEARBY_CONTEXT",
     "CODEX_NEARBY_CONTEXT_RADIUS",
@@ -1390,10 +1593,12 @@ addCheck(
     "symbol.detail ? ` - ${symbol.detail}` : \"\"",
   ]) &&
     includesAll(backend, [
+      "biblatex::Bibliography::parse",
       "format_bib_entry_detail",
-      "bib_field_value(entry_text, \"author\")",
-      "bib_field_value(entry_text, \"year\")",
-      "bib_field_value(entry_text, \"title\")",
+      "entry.author()",
+      "entry.date()",
+      ".title()",
+      "normalize_bib_field_value(&chunks.format_verbatim())",
     ]),
 );
 
@@ -1611,8 +1816,36 @@ addCheck(
 );
 
 addCheck(
+  "Codex command box shows a compact preflight before running",
+  includesAll(appAndCodexContext, [
+    "codexPreflightItems",
+    "shouldShowCodexPreflight",
+    "Codex 运行前预检",
+    "预检",
+    "执行会修改文件；问只读分析",
+    "允许修改",
+    "当前项目内",
+    "锁定片段",
+    "锁定选区",
+    "锁定光标",
+    "@文件 ${codexPromptReferencedFiles.length}",
+    "#符号 ${codexPromptReferencedSymbols.length}",
+    "带 diff",
+    "codex-preflight-strip",
+  ]) &&
+    hasCssBlock(".codex-preflight-strip", [
+      "background: #f8fbfd;",
+      "display: flex;",
+      "overflow: auto hidden;",
+    ]) &&
+    hasCssBlock(".codex-preflight-item", ["border-radius: 999px;", "max-width: 190px;"]) &&
+    hasCssBlock(".codex-preflight-item-scope", ["background: #f1f7ff;", "color: #255f9f;"]) &&
+    hasCssBlock(".codex-preflight-item-warn", ["background: #fff8ea;", "color: #7b5918;"]),
+);
+
+addCheck(
   "Codex context-only mode injects an edit scope and auto-reverts out-of-scope files",
-  includesAll(app, [
+  includesAll(appAndCodexDiff, [
     "isCodexContextOnlyEnabled",
     "setIsCodexContextOnlyEnabled",
     "canUseCodexContextScope",
@@ -1620,17 +1853,36 @@ addCheck(
     "Codex edit scope lock from LaTeX Studio:",
     "Modify only the files listed below.",
     "Allowed edit files:",
-    "enforceCodexContextScope(rawSummary, contextScopeFiles)",
-    "revertCodexFile(project.root, nextSummary.runId, file)",
-    "已自动撤回 ${scopeResult.revertedFiles.length} 个上下文外文件",
+    "allowedFiles: contextScopeFiles",
+    "const scopeRevertedFiles = summary.scopeRevertedFiles ?? [];",
+    "已自动撤回 ${scopeRevertedFiles.length} 个上下文外文件",
+    "CodexScopeGuardNotice",
+    "范围护栏已生效",
+    "已从运行前快照恢复 {files.length} 个上下文外文件",
+    "没有保留的文件变化。",
     'aria-label="仅改上下文文件"',
     "仅上下文",
     "codex-scope-toggle",
   ]) &&
+    includesAll(types, ["scopeRevertedFiles?: string[]", "allowedFiles?: string[]"]) &&
+    includesAll(backend, [
+      "allowed_files: Option<Vec<String>>",
+      "scope_reverted_files: Vec<String>",
+      "normalize_codex_allowed_files",
+      "enforce_codex_allowed_file_scope",
+      "restore_snapshot_file_state(root, run_id, &relative)",
+      "codex_allowed_file_scope_reverts_out_of_scope_changes_before_compile",
+    ]) &&
     hasCssBlock(".codex-scope-toggle.codex-context-toggle-on", [
       "background: #eaf3ff;",
       "color: #255f9f;",
     ]) &&
+    hasCssBlock(".codex-scope-guard-notice", [
+      "background: #f4f8ff;",
+      "border-left: 3px solid #4e8fd6;",
+      "display: grid;",
+    ]) &&
+    hasCssBlock(".codex-scope-guard-files", ["display: flex;", "flex-wrap: wrap;"]) &&
     hasCssBlock(".codex-command-bar", [
       "grid-template-columns: auto minmax(0, 1fr) auto auto auto auto auto;",
     ]),
@@ -1810,20 +2062,31 @@ addCheck(
 );
 
 addCheck(
-  "Codex ask output can be copied and converted into edit prompts",
+  "Codex ask output can be copied and converted into edit prompts or review comments",
   includesAll(app, [
     "handleCopyCodexAnswer",
     "navigator.clipboard.writeText(codexAnswer)",
     "handleUseCodexAnswerAsEditPrompt",
+    "handleInsertCodexAnswerAsReviewComment",
+    "formatCodexAnswerReviewComment(codexAnswer",
     "Codex 问答建议：",
     "已把 Codex 回答转为修改指令",
+    "已把 Codex 输出插入为 REVIEW 批注",
     'className="codex-answer-actions"',
     "复制 Codex 回答",
     "Codex 输出",
     "已复制 Codex 输出。",
     "把回答转成修改指令",
+    "把回答插入为 REVIEW 批注",
     "转为修改",
+    "转为批注",
   ]) &&
+    includesAll(editorLogic, [
+      "export function formatCodexAnswerReviewComment",
+      "% REVIEW: Codex 建议",
+      "% REVIEW-END",
+    ]) &&
+    editorLogicTests.includes("formatCodexAnswerReviewComment(\"Add motivation.") &&
     hasCssBlock(".codex-answer-header", [
       "display: flex;",
       "justify-content: space-between;",
@@ -1958,6 +2221,9 @@ addCheck(
     "buildReferenceIssueFixPrompt(project, issue, sourceContext)",
     "buildReferenceIssuesFixPrompt",
     "buildReferenceIssuesFixPrompt(project, projectReferenceIssues, sourceContexts)",
+    "codexAllowedFilesForReferenceIssues([issue], allProjectFiles, projectBibFiles)",
+    "codexAllowedFilesForReferenceIssues(projectReferenceIssues, allProjectFiles, projectBibFiles)",
+    "缺失引用相关文件",
     "MAX_CODEX_REFERENCE_ISSUES",
     "MAX_CODEX_REFERENCE_SOURCE_SNIPPETS",
     "REFERENCE_SOURCE_CONTEXT_RADIUS",
@@ -2326,15 +2592,17 @@ addCheck(
   "editor uses a white LaTeX theme with command and comment highlighting",
   includesAll(app, [
     "MONACO_LATEX_THEME",
-    "latex-studio-light",
     "configureMonacoLatexTheme",
     "beforeMount={configureMonacoLatexTheme}",
     "theme={MONACO_LATEX_THEME}",
-    "setMonarchTokensProvider(\"latex\"",
-    "comment.latex",
-    "keyword.latex",
-    "\"editor.background\": \"#ffffff\"",
   ]) &&
+    includesAll(monacoLatex, [
+      "latex-studio-light",
+      "setMonarchTokensProvider(\"latex\"",
+      "comment.latex",
+      "keyword.latex",
+      "\"editor.background\": \"#ffffff\"",
+    ]) &&
     !app.includes('theme="vs-dark"') &&
     hasCssBlock(":root", ["background: #ffffff;"]) &&
     hasCssBlock(".app-shell", ["background: #ffffff;"]) &&
@@ -2751,11 +3019,12 @@ addCheck(
     "symbol.detail ?? symbol.kind",
   ]) &&
     includesAll(backend, [
+      "biblatex::Bibliography::parse",
       "format_bib_entry_detail",
-      "bib_field_value(entry_text, \"author\")",
-      "bib_field_value(entry_text, \"year\")",
-      "bib_field_value(entry_text, \"title\")",
       "format_bib_authors",
+      "bib_entry_year",
+      ".title()",
+      "normalize_bib_field_value(&chunks.format_verbatim())",
       "Local LaTeX Studio with Codex",
     ]),
 );
@@ -2827,6 +3096,10 @@ addCheck(
     "buildTodoFixPrompt",
     "buildTodoFixPrompt(project, item, sourceContext)",
     "buildTodosFixPrompt(project, unresolvedTodos, sourceContexts)",
+    "codexAllowedFilesForTodos([item], allProjectFiles)",
+    "codexAllowedFilesForTodos(unresolvedTodos, allProjectFiles)",
+    "当前批注文件",
+    "未解决批注文件",
     "Address the unresolved TODO/review comments in this LaTeX project.",
     "Codex 批量批注前保存",
     "todo-batch-codex-button",

@@ -119,6 +119,34 @@ export type ProjectTodo = {
   resolved: boolean;
 };
 
+export type CodexEditorContext = {
+  source?: "editor" | "diff-hunk";
+  file: string;
+  cursorLine: number;
+  cursorColumn: number;
+  activeSection?: {
+    kind: OutlineItem["kind"];
+    title: string;
+    line: number;
+    level: number;
+  };
+  activeSectionSource?: {
+    startLine: number;
+    endLine: number;
+    text: string;
+    truncated: boolean;
+  };
+  selectedText: string;
+  selectedCharCount: number;
+  selectionStartLine?: number;
+  selectionEndLine?: number;
+  truncated: boolean;
+  nearbyStartLine: number;
+  nearbyEndLine: number;
+  nearbyText: string;
+  nearbyTruncated: boolean;
+};
+
 export type ProjectReferenceIssue = {
   kind: "citation" | "label";
   key: string;
@@ -194,6 +222,7 @@ export type CodexRunRequest = {
   projectRoot: string;
   prompt: string;
   autoCompile?: boolean;
+  allowedFiles?: string[];
 };
 
 export type CodexAskRequest = {
@@ -217,6 +246,7 @@ export type DiffSummary = {
   changedFiles: string[];
   unifiedDiff: string;
   canRevert: boolean;
+  scopeRevertedFiles?: string[];
   promptPreview?: string | null;
   finalMessage?: string | null;
 };

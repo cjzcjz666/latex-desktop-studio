@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   CodexAskRequest,
   CodexAskResult,
@@ -53,16 +54,35 @@ export function listRecentProjects() {
   return invoke<RecentProject[]>("list_recent_projects");
 }
 
-export function chooseProjectFolder() {
-  return invoke<string | null>("choose_project_folder");
+export async function chooseProjectFolder() {
+  return singleDialogPath(
+    await open({
+      title: "选择 LaTeX 项目文件夹",
+      directory: true,
+      multiple: false,
+    }),
+  );
 }
 
-export function chooseProjectZip() {
-  return invoke<string | null>("choose_project_zip");
+export async function chooseProjectZip() {
+  return singleDialogPath(
+    await open({
+      title: "选择 LaTeX 项目 ZIP",
+      directory: false,
+      multiple: false,
+      filters: [{ name: "ZIP 项目", extensions: ["zip"] }],
+    }),
+  );
 }
 
-export function chooseImportFiles() {
-  return invoke<string[]>("choose_import_files");
+export async function chooseImportFiles() {
+  const selected = await open({
+    title: "选择要导入到项目的文件",
+    directory: false,
+    multiple: true,
+  });
+  if (!selected) return [];
+  return Array.isArray(selected) ? selected : [selected];
 }
 
 export function importProjectZip(zipPath: string) {
@@ -177,12 +197,24 @@ export function revealPdfFile(projectRoot: string, pdfPath: string) {
   return invoke<void>("reveal_pdf_file", { projectRoot, pdfPath });
 }
 
-export function exportPdfFile(projectRoot: string, pdfPath: string) {
-  return invoke<string | null>("export_pdf_file", { projectRoot, pdfPath });
+export async function exportPdfFile(projectRoot: string, pdfPath: string) {
+  const targetPath = await save({
+    title: "导出 PDF",
+    defaultPath: fileNameFromPath(pdfPath) || "document.pdf",
+    filters: [{ name: "PDF", extensions: ["pdf"] }],
+  });
+  if (!targetPath) return null;
+  return invoke<string>("export_pdf_file", { projectRoot, pdfPath, targetPath });
 }
 
-export function exportProjectZip(projectRoot: string) {
-  return invoke<string | null>("export_project_zip", { projectRoot });
+export async function exportProjectZip(projectRoot: string) {
+  const targetPath = await save({
+    title: "导出项目源码 ZIP",
+    defaultPath: `${sanitizeExportName(fileNameFromPath(projectRoot) || "latex-project")}.zip`,
+    filters: [{ name: "ZIP 项目", extensions: ["zip"] }],
+  });
+  if (!targetPath) return null;
+  return invoke<string>("export_project_zip", { projectRoot, targetPath });
 }
 
 export function saveFile(projectRoot: string, path: string, content: string) {
@@ -255,4 +287,22 @@ export function revertCodexRun(projectRoot: string, runId: string) {
 
 export function revertCodexFile(projectRoot: string, runId: string, path: string) {
   return invoke<DiffSummary>("revert_codex_file", { projectRoot, runId, path });
+}
+
+function singleDialogPath(value: string | string[] | null) {
+  if (Array.isArray(value)) return value[0] ?? null;
+  return value;
+}
+
+function fileNameFromPath(path: string) {
+  return path.replace(/\\/g, "/").split("/").filter(Boolean).pop() ?? "";
+}
+
+function sanitizeExportName(name: string) {
+  const sanitized = name
+    .split("")
+    .map((character) => (/^[A-Za-z0-9._-]$/.test(character) ? character : "-"))
+    .join("")
+    .replace(/^-+|-+$/g, "");
+  return sanitized || "latex-project";
 }

@@ -1,8 +1,9 @@
+use biblatex::ChunksExt;
 use serde::{Deserialize, Serialize};
 use similar::TextDiff;
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::{Mutex, OnceLock};
@@ -10,6 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
+use zip::{write::SimpleFileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 static ACTIVE_COMPILES: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
 static ACTIVE_CODEX_RUNS: OnceLock<Mutex<HashMap<String, u32>>> = OnceLock::new();
@@ -270,6 +272,8 @@ struct CodexRunRequest {
     project_root: String,
     prompt: String,
     auto_compile: Option<bool>,
+    #[serde(default)]
+    allowed_files: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -301,6 +305,8 @@ struct DiffSummary {
     changed_files: Vec<String>,
     unified_diff: String,
     can_revert: bool,
+    #[serde(default)]
+    scope_reverted_files: Vec<String>,
     #[serde(default)]
     prompt_preview: Option<String>,
     #[serde(default)]
@@ -583,36 +589,6 @@ fn list_recent_projects() -> Result<Vec<RecentProject>, String> {
     projects.retain(|project| Path::new(&project.root).is_dir());
     projects.sort_by(|left, right| right.last_opened.cmp(&left.last_opened));
     Ok(projects)
-}
-
-#[tauri::command]
-fn choose_project_folder() -> Result<Option<String>, String> {
-    run_osascript_optional(
-        "set chosenFolder to choose folder with prompt \"选择 LaTeX 项目文件夹\"\nPOSIX path of chosenFolder",
-    )
-}
-
-#[tauri::command]
-fn choose_project_zip() -> Result<Option<String>, String> {
-    run_osascript_optional(
-        "set chosenFile to choose file with prompt \"选择 LaTeX 项目 ZIP\"\nPOSIX path of chosenFile",
-    )
-}
-
-#[tauri::command]
-fn choose_import_files() -> Result<Vec<String>, String> {
-    let Some(output) = run_osascript_optional(
-        "set chosenFiles to choose file with prompt \"选择要导入到项目的文件\" with multiple selections allowed\nset outputText to \"\"\nrepeat with itemRef in chosenFiles\n  set outputText to outputText & POSIX path of itemRef & linefeed\nend repeat\nreturn outputText",
-    )?
-    else {
-        return Ok(Vec::new());
-    };
-    Ok(output
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToString::to_string)
-        .collect())
 }
 
 #[tauri::command]
@@ -1074,33 +1050,28 @@ fn reveal_pdf_file(project_root: String, pdf_path: String) -> Result<(), String>
 }
 
 #[tauri::command]
-fn export_pdf_file(project_root: String, pdf_path: String) -> Result<Option<String>, String> {
+fn export_pdf_file(
+    project_root: String,
+    pdf_path: String,
+    target_path: String,
+) -> Result<String, String> {
     let root = canonicalize_existing_dir(PathBuf::from(project_root))?;
     let path = resolve_project_pdf_existing(&root, &pdf_path)?;
-    let default_name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("document.pdf");
-    let Some(target) = choose_save_path("导出 PDF", default_name)? else {
-        return Ok(None);
-    };
+    let target = expand_user_path(&target_path)?;
     let target = with_extension_if_missing(target, "pdf");
     copy_pdf_export(&path, &target)?;
-    Ok(Some(target.to_string_lossy().to_string()))
+    Ok(target.to_string_lossy().to_string())
 }
 
 #[tauri::command]
-fn export_project_zip(project_root: String) -> Result<Option<String>, String> {
+fn export_project_zip(project_root: String, target_path: String) -> Result<String, String> {
     let root = canonicalize_existing_dir(PathBuf::from(project_root))?;
     let settings = load_settings(&root).unwrap_or_default();
     validate_project_settings(&root, &settings)?;
-    let default_name = format!("{}.zip", export_project_name(&root));
-    let Some(target) = choose_save_path("导出项目源码 ZIP", &default_name)? else {
-        return Ok(None);
-    };
+    let target = expand_user_path(&target_path)?;
     let target = with_extension_if_missing(target, "zip");
     export_project_zip_to_path(&root, &settings, &target)?;
-    Ok(Some(target.to_string_lossy().to_string()))
+    Ok(target.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -1510,6 +1481,7 @@ fn run_codex_edit_blocking_with_tools(
     }
 
     let root = canonicalize_existing_dir(PathBuf::from(&request.project_root))?;
+    let allowed_files = normalize_codex_allowed_files(&root, request.allowed_files.as_ref())?;
     let codex = codex_override
         .or_else(|| {
             find_executable(
@@ -1587,9 +1559,22 @@ fn run_codex_edit_blocking_with_tools(
     let stderr = stderr_thread.join().unwrap_or_default();
     let final_message = read_codex_last_message(&last_message_path);
     cleanup_codex_last_message(&last_message_path);
-    let mut summary = diff_snapshot(&root, &run_id)?;
+    let mut summary = enforce_codex_allowed_file_scope(
+        &root,
+        &run_id,
+        diff_snapshot(&root, &run_id)?,
+        allowed_files.as_ref(),
+    )?;
     summary.prompt_preview = codex_prompt_preview(&request.prompt);
     summary.final_message = final_message.clone();
+    for file in &summary.scope_reverted_files {
+        emit_codex_event(
+            app.as_ref(),
+            "file-change",
+            Some(&run_id),
+            &format!("已自动撤回上下文外文件：{file}"),
+        );
+    }
     if !summary.changed_files.is_empty() {
         save_diff_summary(&root, &summary)?;
     }
@@ -3791,56 +3776,124 @@ fn is_cjk_character(character: char) -> bool {
 }
 
 fn parse_bib_symbols(relative: &str, content: &str) -> Vec<ProjectSymbol> {
-    let mut symbols = Vec::new();
-    let lines = content.lines().collect::<Vec<_>>();
-    for (line_index, line) in lines.iter().enumerate() {
-        let Some((entry_type, key)) = parse_bib_entry_header(line) else {
-            continue;
-        };
-        let entry_text = collect_bib_entry_text(&lines, line_index);
-        symbols.push(ProjectSymbol {
+    let line_numbers = bib_entry_line_numbers(content);
+    let Ok(bibliography) = biblatex::Bibliography::parse(content) else {
+        return parse_bib_symbols_from_entry_blocks(relative, content);
+    };
+    bibliography
+        .iter()
+        .map(|entry| ProjectSymbol {
             kind: "citation".to_string(),
-            key,
-            detail: Some(format_bib_entry_detail(&entry_type, &entry_text)),
+            key: entry.key.clone(),
+            detail: Some(format_bib_entry_detail(entry)),
             file: relative.to_string(),
-            line: (line_index + 1) as u32,
-        });
+            line: line_numbers.get(&entry.key).copied().unwrap_or(1),
+        })
+        .collect()
+}
+
+fn parse_bib_symbols_from_entry_blocks(relative: &str, content: &str) -> Vec<ProjectSymbol> {
+    let mut symbols = Vec::new();
+    for (line, entry_type, key, block) in bib_entry_blocks(content) {
+        let normalized_block = normalize_bib_entry_block_for_biblatex(&block);
+        if let Ok(bibliography) = biblatex::Bibliography::parse(&normalized_block) {
+            symbols.extend(bibliography.iter().map(|entry| ProjectSymbol {
+                kind: "citation".to_string(),
+                key: entry.key.clone(),
+                detail: Some(format_bib_entry_detail(entry)),
+                file: relative.to_string(),
+                line,
+            }));
+        } else {
+            symbols.push(ProjectSymbol {
+                kind: "citation".to_string(),
+                key,
+                detail: Some(entry_type),
+                file: relative.to_string(),
+                line,
+            });
+        }
     }
     symbols
 }
 
-fn collect_bib_entry_text(lines: &[&str], start: usize) -> String {
-    let mut entry = String::new();
-    for (offset, line) in lines.iter().enumerate().skip(start) {
-        if offset > start && parse_bib_entry_header(line).is_some() {
-            break;
+fn bib_entry_blocks(content: &str) -> Vec<(u32, String, String, String)> {
+    let mut blocks = Vec::new();
+    let mut current: Option<(u32, String, String, String)> = None;
+    for (line_index, line) in content.lines().enumerate() {
+        if let Some((entry_type, key)) = parse_bib_entry_header(line) {
+            if let Some(block) = current.take() {
+                blocks.push(block);
+            }
+            current = Some(((line_index + 1) as u32, entry_type, key, line.to_string()));
+        } else if let Some((_line, _entry_type, _key, block)) = &mut current {
+            block.push('\n');
+            block.push_str(line);
         }
-        if !entry.is_empty() {
-            entry.push('\n');
-        }
-        entry.push_str(line);
     }
-    entry
+    if let Some(block) = current {
+        blocks.push(block);
+    }
+    blocks
 }
 
-fn format_bib_entry_detail(entry_type: &str, entry_text: &str) -> String {
-    let mut pieces = vec![entry_type.to_string()];
-    if let Some(author) =
-        bib_field_value(entry_text, "author").map(|value| format_bib_authors(&value))
+fn normalize_bib_entry_block_for_biblatex(block: &str) -> String {
+    let Some(start) = block.find('@') else {
+        return block.to_string();
+    };
+    let after_at = start + 1;
+    let entry_type_len = block[after_at..]
+        .chars()
+        .take_while(|character| character.is_ascii_alphabetic())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    let mut open_index = after_at + entry_type_len;
+    while matches!(block[open_index..].chars().next(), Some(character) if character.is_whitespace())
     {
+        open_index += block[open_index..].chars().next().unwrap().len_utf8();
+    }
+    if !block[open_index..].starts_with('(') {
+        return block.to_string();
+    }
+
+    let mut normalized = block.to_string();
+    normalized.replace_range(open_index..open_index + 1, "{");
+    if let Some((close_index, ')')) = normalized
+        .char_indices()
+        .rev()
+        .find(|(_index, character)| !character.is_whitespace())
+    {
+        normalized.replace_range(close_index..close_index + 1, "}");
+    }
+    normalized
+}
+
+fn bib_entry_line_numbers(content: &str) -> HashMap<String, u32> {
+    let mut line_numbers = HashMap::new();
+    for (line_index, line) in content.lines().enumerate() {
+        if let Some((_entry_type, key)) = parse_bib_entry_header(line) {
+            line_numbers.entry(key).or_insert((line_index + 1) as u32);
+        }
+    }
+    line_numbers
+}
+
+fn format_bib_entry_detail(entry: &biblatex::Entry) -> String {
+    let mut pieces = vec![entry.entry_type.to_string()];
+    if let Ok(authors) = entry.author() {
+        let author = format_bib_authors(&authors);
         if !author.is_empty() {
             pieces.push(author);
         }
     }
-    if let Some(year) =
-        bib_field_value(entry_text, "year").map(|value| normalize_bib_field_value(&value))
-    {
+    if let Some(year) = bib_entry_year(entry) {
         if !year.is_empty() {
             pieces.push(year);
         }
     }
-    if let Some(title) =
-        bib_field_value(entry_text, "title").map(|value| normalize_bib_field_value(&value))
+    if let Ok(title) = entry
+        .title()
+        .map(|chunks| normalize_bib_field_value(&chunks.format_verbatim()))
     {
         if !title.is_empty() {
             pieces.push(truncate_bib_detail(&title, 90));
@@ -3849,119 +3902,22 @@ fn format_bib_entry_detail(entry_type: &str, entry_text: &str) -> String {
     pieces.join(" · ")
 }
 
-fn bib_field_value(entry_text: &str, field: &str) -> Option<String> {
-    let value_start = find_bib_field_value_start(entry_text, field)?;
-    let rest = entry_text[value_start..].trim_start();
-    let first = rest.chars().next()?;
-    if first == '{' {
-        return Some(read_balanced_bib_value(rest, '{', '}'));
+fn bib_entry_year(entry: &biblatex::Entry) -> Option<String> {
+    if let Ok(date) = entry.date() {
+        if let biblatex::PermissiveType::Typed(date) = date {
+            let year = match date.value {
+                biblatex::DateValue::At(datetime)
+                | biblatex::DateValue::After(datetime)
+                | biblatex::DateValue::Before(datetime) => datetime.year,
+                biblatex::DateValue::Between(start, _end) => start.year,
+            };
+            return Some(year.to_string());
+        }
     }
-    if first == '"' {
-        return Some(read_quoted_bib_value(rest));
-    }
-    Some(
-        rest.chars()
-            .take_while(|character| !matches!(character, ',' | '\n' | '\r'))
-            .collect::<String>(),
-    )
-}
-
-fn find_bib_field_value_start(entry_text: &str, field: &str) -> Option<usize> {
-    let field_lower = field.to_ascii_lowercase();
-    let mut search_start = 0;
-    while search_start < entry_text.len() {
-        let haystack = entry_text[search_start..].to_ascii_lowercase();
-        let Some(relative_position) = haystack.find(&field_lower) else {
-            break;
-        };
-        let position = search_start + relative_position;
-        let before = entry_text[..position].chars().next_back();
-        if matches!(before, Some(character) if character.is_ascii_alphanumeric() || character == '_')
-        {
-            search_start = position + field.len();
-            continue;
-        }
-        let mut index = position + field.len();
-        while matches!(entry_text[index..].chars().next(), Some(character) if character.is_whitespace())
-        {
-            index += entry_text[index..].chars().next().unwrap().len_utf8();
-        }
-        if entry_text[index..].starts_with('=') {
-            return Some(index + 1);
-        }
-        search_start = index;
-    }
-    None
-}
-
-fn read_balanced_bib_value(value: &str, open: char, close: char) -> String {
-    let mut depth = 0_i32;
-    let mut result = String::new();
-    let mut started = false;
-    let mut escaped = false;
-    for character in value.chars() {
-        if !started {
-            if character == open {
-                started = true;
-                depth = 1;
-            }
-            continue;
-        }
-        if escaped {
-            result.push(character);
-            escaped = false;
-            continue;
-        }
-        if character == '\\' {
-            result.push(character);
-            escaped = true;
-            continue;
-        }
-        if character == open {
-            depth += 1;
-            result.push(character);
-            continue;
-        }
-        if character == close {
-            depth -= 1;
-            if depth == 0 {
-                break;
-            }
-            result.push(character);
-            continue;
-        }
-        result.push(character);
-    }
-    result
-}
-
-fn read_quoted_bib_value(value: &str) -> String {
-    let mut result = String::new();
-    let mut started = false;
-    let mut escaped = false;
-    for character in value.chars() {
-        if !started {
-            if character == '"' {
-                started = true;
-            }
-            continue;
-        }
-        if escaped {
-            result.push(character);
-            escaped = false;
-            continue;
-        }
-        if character == '\\' {
-            result.push(character);
-            escaped = true;
-            continue;
-        }
-        if character == '"' {
-            break;
-        }
-        result.push(character);
-    }
-    result
+    entry
+        .get("year")
+        .map(|chunks| normalize_bib_field_value(&chunks.format_verbatim()))
+        .filter(|year| !year.is_empty())
 }
 
 fn normalize_bib_field_value(value: &str) -> String {
@@ -3974,9 +3930,9 @@ fn normalize_bib_field_value(value: &str) -> String {
         .join(" ")
 }
 
-fn format_bib_authors(author_value: &str) -> String {
-    let authors = author_value
-        .split(" and ")
+fn format_bib_authors(authors: &[biblatex::Person]) -> String {
+    let authors = authors
+        .iter()
         .map(format_bib_author_name)
         .filter(|name| !name.is_empty())
         .collect::<Vec<_>>();
@@ -3988,17 +3944,12 @@ fn format_bib_authors(author_value: &str) -> String {
     }
 }
 
-fn format_bib_author_name(author: &str) -> String {
-    let normalized = normalize_bib_field_value(author);
-    if let Some((last, _rest)) = normalized.split_once(',') {
-        return last.trim().to_string();
+fn format_bib_author_name(author: &biblatex::Person) -> String {
+    let family = normalize_bib_field_value(&author.name);
+    if !family.is_empty() {
+        return family;
     }
-    normalized
-        .split_whitespace()
-        .last()
-        .unwrap_or("")
-        .trim()
-        .to_string()
+    normalize_bib_field_value(&author.given_name)
 }
 
 fn truncate_bib_detail(value: &str, max_chars: usize) -> String {
@@ -4442,42 +4393,6 @@ fn tool_status(
     }
 }
 
-fn run_osascript_optional(script: &str) -> Result<Option<String>, String> {
-    let output = Command::new("osascript")
-        .arg("-e")
-        .arg(script)
-        .output()
-        .map_err(|err| format!("无法打开 macOS 选择器：{err}"))?;
-    if output.status.success() {
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if text.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(text))
-        }
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if stderr.contains("User canceled") || stderr.contains("-128") {
-            Ok(None)
-        } else {
-            Err(format!("macOS 选择器失败：{}", stderr.trim()))
-        }
-    }
-}
-
-fn choose_save_path(prompt: &str, default_name: &str) -> Result<Option<PathBuf>, String> {
-    let script = format!(
-        "set targetFile to choose file name with prompt {} default name {}\nPOSIX path of targetFile",
-        applescript_string(prompt),
-        applescript_string(default_name)
-    );
-    Ok(run_osascript_optional(&script)?.map(PathBuf::from))
-}
-
-fn applescript_string(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
 fn with_extension_if_missing(mut path: PathBuf, extension: &str) -> PathBuf {
     if path.extension().is_none() {
         path.set_extension(extension);
@@ -4511,53 +4426,50 @@ fn export_project_zip_to_path(
             .map_err(|err| format!("failed to create export directory: {err}"))?;
     }
 
-    let staging_parent =
-        std::env::temp_dir().join(format!("latex-studio-export-{}", Uuid::new_v4()));
     let project_name = export_project_name(root);
-    let staging_project = staging_parent.join(&project_name);
-    fs::create_dir_all(&staging_project)
-        .map_err(|err| format!("failed to create export staging directory: {err}"))?;
-
     let skip_target = if target.exists() {
         fs::canonicalize(target).ok()
     } else {
         None
     };
-    let copy_result =
-        copy_project_sources_for_export(root, settings, &staging_project, skip_target.as_deref());
-    if let Err(err) = copy_result {
-        let _ = fs::remove_dir_all(&staging_parent);
+    let temp_target = target.with_extension(format!(
+        "{}.tmp-{}",
+        target
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("zip"),
+        Uuid::new_v4()
+    ));
+    let write_result = write_project_zip_archive(
+        root,
+        settings,
+        &project_name,
+        &temp_target,
+        skip_target.as_deref(),
+    );
+    if let Err(err) = write_result {
+        let _ = fs::remove_file(&temp_target);
         return Err(err);
     }
-
     if target.exists() {
         fs::remove_file(target)
             .map_err(|err| format!("failed to replace existing export file: {err}"))?;
     }
-
-    let zip = find_executable("zip", &["/usr/bin/zip"])
-        .ok_or_else(|| "未找到系统 zip 命令，无法导出源码 ZIP。".to_string())?;
-    let status = Command::new(zip)
-        .args(["-qry"])
-        .arg(target)
-        .arg(&project_name)
-        .current_dir(&staging_parent)
-        .status()
-        .map_err(|err| format!("failed to run zip: {err}"))?;
-    let _ = fs::remove_dir_all(&staging_parent);
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("导出源码 ZIP 失败：{status}"))
-    }
+    fs::rename(&temp_target, target).map_err(|err| format!("failed to save export ZIP: {err}"))
 }
 
-fn copy_project_sources_for_export(
+fn write_project_zip_archive(
     root: &Path,
     settings: &ProjectSettings,
-    target_root: &Path,
+    project_name: &str,
+    target: &Path,
     skip_target: Option<&Path>,
 ) -> Result<(), String> {
+    let file =
+        fs::File::create(target).map_err(|err| format!("failed to create export ZIP: {err}"))?;
+    let mut writer = ZipWriter::new(file);
+    let file_options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    let dir_options = file_options.unix_permissions(0o755);
     let build_dir = normalize_relative_path(Path::new(&settings.build_dir));
     let main_pdf = Path::new(&settings.main_file)
         .file_stem()
@@ -4568,23 +4480,12 @@ fn copy_project_sources_for_export(
     });
 
     for entry in walker {
-        let entry = entry.map_err(|err| format!("failed to walk project for export: {err}"))?;
+        let entry = entry.map_err(|err| format!("failed to walk project for ZIP export: {err}"))?;
         let path = entry.path();
-        if path == root {
-            continue;
-        }
-        let relative = path
-            .strip_prefix(root)
-            .map_err(|err| format!("failed to export relative path: {err}"))?;
-        if entry.file_type().is_symlink() {
-            continue;
-        }
-        if entry.file_type().is_dir() {
-            fs::create_dir_all(target_root.join(relative))
-                .map_err(|err| format!("failed to create export directory: {err}"))?;
-            continue;
-        }
-        if !entry.file_type().is_file() {
+        if path == root
+            || entry.file_type().is_symlink()
+            || !entry.file_type().is_file() && !entry.file_type().is_dir()
+        {
             continue;
         }
         if let Some(skip_target) = skip_target {
@@ -4594,19 +4495,33 @@ fn copy_project_sources_for_export(
                 }
             }
         }
-        let target = target_root.join(relative);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("failed to create export directory: {err}"))?;
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|err| format!("failed to export relative path: {err}"))?;
+        let normalized = normalize_relative_path(relative);
+        if normalized.is_empty() {
+            continue;
         }
-        fs::copy(path, &target).map_err(|err| {
-            format!(
-                "failed to copy {} into export package: {err}",
-                relative.to_string_lossy()
-            )
-        })?;
+        let archive_path = format!("{project_name}/{normalized}");
+        validate_zip_entry_path(&archive_path)?;
+        if entry.file_type().is_dir() {
+            writer
+                .add_directory(format!("{archive_path}/"), dir_options)
+                .map_err(|err| format!("failed to add ZIP directory {normalized}: {err}"))?;
+            continue;
+        }
+        writer
+            .start_file(&archive_path, file_options)
+            .map_err(|err| format!("failed to add ZIP file {normalized}: {err}"))?;
+        let mut source =
+            fs::File::open(path).map_err(|err| format!("failed to read export file: {err}"))?;
+        io::copy(&mut source, &mut writer)
+            .map_err(|err| format!("failed to write ZIP file {normalized}: {err}"))?;
     }
-    Ok(())
+    writer
+        .finish()
+        .map(|_| ())
+        .map_err(|err| format!("failed to finish export ZIP: {err}"))
 }
 
 fn should_skip_export_entry(
@@ -4710,7 +4625,6 @@ fn sanitize_export_name(name: &str) -> String {
 }
 
 fn import_project_zip_to_root(source_zip: &Path, target_root: &Path) -> Result<(), String> {
-    validate_zip_archive_entries(source_zip)?;
     if target_root.exists() {
         return Err(format!(
             "目标项目目录已存在：{}",
@@ -4728,18 +4642,9 @@ fn import_project_zip_to_root(source_zip: &Path, target_root: &Path) -> Result<(
     fs::create_dir_all(&staging_root)
         .map_err(|err| format!("failed to create import staging directory: {err}"))?;
 
-    let unzip = find_executable("unzip", &["/usr/bin/unzip"])
-        .ok_or_else(|| "未找到系统 unzip 命令，无法导入 ZIP 项目。".to_string())?;
-    let status = Command::new(unzip)
-        .args(["-qq"])
-        .arg(source_zip)
-        .arg("-d")
-        .arg(&staging_root)
-        .status()
-        .map_err(|err| format!("failed to unzip project: {err}"))?;
-    if !status.success() {
+    if let Err(err) = extract_zip_archive_to_directory(source_zip, &staging_root) {
         let _ = fs::remove_dir_all(&staging_parent);
-        return Err(format!("解压 ZIP 项目失败：{status}"));
+        return Err(err);
     }
 
     let content_root = detect_import_content_root(&staging_root)?;
@@ -4750,21 +4655,57 @@ fn import_project_zip_to_root(source_zip: &Path, target_root: &Path) -> Result<(
     copy_result
 }
 
+#[cfg(test)]
 fn validate_zip_archive_entries(source_zip: &Path) -> Result<(), String> {
-    let unzip = find_executable("unzip", &["/usr/bin/unzip"])
-        .ok_or_else(|| "未找到系统 unzip 命令，无法检查 ZIP 项目。".to_string())?;
-    let output = Command::new(unzip)
-        .args(["-Z1"])
-        .arg(source_zip)
-        .output()
-        .map_err(|err| format!("failed to inspect zip: {err}"))?;
-    if !output.status.success() {
-        return Err("ZIP 文件无法读取或已损坏。".to_string());
-    }
-    for raw_entry in String::from_utf8_lossy(&output.stdout).lines() {
-        validate_zip_entry_path(raw_entry)?;
+    let mut archive = open_zip_archive(source_zip)?;
+    for index in 0..archive.len() {
+        let file = archive
+            .by_index(index)
+            .map_err(|err| format!("ZIP 文件无法读取或已损坏：{err}"))?;
+        validate_zip_entry_path(file.name())?;
     }
     Ok(())
+}
+
+fn extract_zip_archive_to_directory(source_zip: &Path, target_root: &Path) -> Result<(), String> {
+    let mut archive = open_zip_archive(source_zip)?;
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|err| format!("ZIP 文件无法读取或已损坏：{err}"))?;
+        let entry_name = file.name().to_string();
+        validate_zip_entry_path(&entry_name)?;
+        if file.is_symlink() {
+            continue;
+        }
+        let Some(relative) = zip_entry_relative_path(&entry_name)? else {
+            continue;
+        };
+        let target = target_root.join(&relative);
+        if !target.starts_with(target_root) {
+            return Err(format!("ZIP 路径不安全：{entry_name}"));
+        }
+        if file.is_dir() {
+            fs::create_dir_all(&target)
+                .map_err(|err| format!("failed to create ZIP import directory: {err}"))?;
+        } else if file.is_file() {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| format!("failed to create ZIP import directory: {err}"))?;
+            }
+            let mut output = fs::File::create(&target)
+                .map_err(|err| format!("failed to create imported ZIP file: {err}"))?;
+            io::copy(&mut file, &mut output)
+                .map_err(|err| format!("failed to extract ZIP file {entry_name}: {err}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn open_zip_archive(source_zip: &Path) -> Result<ZipArchive<fs::File>, String> {
+    let file = fs::File::open(source_zip)
+        .map_err(|err| format!("无法读取 ZIP 文件 {}：{err}", source_zip.to_string_lossy()))?;
+    ZipArchive::new(file).map_err(|err| format!("ZIP 文件无法读取或已损坏：{err}"))
 }
 
 fn validate_zip_entry_path(raw_entry: &str) -> Result<(), String> {
@@ -4792,6 +4733,29 @@ fn validate_zip_entry_path(raw_entry: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn zip_entry_relative_path(raw_entry: &str) -> Result<Option<PathBuf>, String> {
+    let normalized = raw_entry.replace('\\', "/");
+    let trimmed = normalized.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let mut relative = PathBuf::new();
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::Normal(value) => relative.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!("ZIP 路径不安全：{raw_entry}"));
+            }
+        }
+    }
+    if relative.as_os_str().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(relative))
+    }
 }
 
 fn detect_import_content_root(staging_root: &Path) -> Result<PathBuf, String> {
@@ -5808,6 +5772,67 @@ fn load_snapshot_manifest(root: &Path, run_id: &str) -> Result<SnapshotManifest,
     serde_json::from_str(&content).map_err(|err| format!("invalid snapshot manifest: {err}"))
 }
 
+fn normalize_codex_allowed_files(
+    root: &Path,
+    allowed_files: Option<&Vec<String>>,
+) -> Result<Option<BTreeSet<String>>, String> {
+    let Some(files) = allowed_files else {
+        return Ok(None);
+    };
+    if files.is_empty() {
+        return Ok(None);
+    }
+
+    let mut normalized = BTreeSet::new();
+    for file in files {
+        let path = Path::new(file.trim());
+        reject_reserved_project_path(path)?;
+        let relative = normalize_relative_path(path);
+        if relative.is_empty() {
+            return Err("Codex 允许修改的文件路径不能为空。".to_string());
+        }
+        if root.join(&relative).exists() {
+            resolve_project_file_existing(root, Path::new(&relative))?;
+        } else {
+            resolve_project_file_for_write(root, Path::new(&relative))?;
+        }
+        normalized.insert(relative);
+    }
+
+    if normalized.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(normalized))
+    }
+}
+
+fn enforce_codex_allowed_file_scope(
+    root: &Path,
+    run_id: &str,
+    summary: DiffSummary,
+    allowed_files: Option<&BTreeSet<String>>,
+) -> Result<DiffSummary, String> {
+    let Some(allowed_files) = allowed_files else {
+        return Ok(summary);
+    };
+    if summary.changed_files.is_empty() {
+        return Ok(summary);
+    }
+
+    let mut reverted_files = Vec::new();
+    for relative in summary.changed_files {
+        if allowed_files.contains(&relative) {
+            continue;
+        }
+        restore_snapshot_file_state(root, run_id, &relative)?;
+        reverted_files.push(relative);
+    }
+
+    let mut next_summary = diff_snapshot(root, run_id)?;
+    next_summary.scope_reverted_files = reverted_files;
+    Ok(next_summary)
+}
+
 fn diff_snapshot(root: &Path, run_id: &str) -> Result<DiffSummary, String> {
     let manifest = load_snapshot_manifest(root, run_id)?;
     let before_files = manifest.files.into_iter().collect::<BTreeSet<_>>();
@@ -5906,6 +5931,7 @@ fn diff_file_sets(
         changed_files,
         unified_diff,
         can_revert,
+        scope_reverted_files: Vec::new(),
         prompt_preview: None,
         final_message: None,
     })
@@ -6136,6 +6162,35 @@ fn revert_snapshot(root: &Path, run_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn restore_snapshot_file_state(root: &Path, run_id: &str, relative: &str) -> Result<(), String> {
+    let relative_path = Path::new(relative);
+    reject_reserved_project_path(relative_path)?;
+    let normalized = normalize_relative_path(relative_path);
+    if normalized.is_empty() {
+        return Err("要撤回的文件路径不能为空。".to_string());
+    }
+
+    let manifest = load_snapshot_manifest(root, run_id)?;
+    let before_files = manifest.files.into_iter().collect::<BTreeSet<_>>();
+    let snapshot_root = snapshot_root(root, run_id);
+    if before_files.contains(&normalized) {
+        let source = snapshot_root.join(&normalized);
+        let target = resolve_project_file_for_write(root, Path::new(&normalized))?;
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|err| format!("failed to create project directory: {err}"))?;
+        }
+        fs::copy(&source, &target)
+            .map_err(|err| format!("failed to restore {normalized}: {err}"))?;
+    } else {
+        let target = resolve_project_file_existing(root, Path::new(&normalized))?;
+        fs::remove_file(&target)
+            .map_err(|err| format!("failed to remove new file {normalized}: {err}"))?;
+    }
+
+    Ok(())
+}
+
 fn revert_snapshot_file(root: &Path, run_id: &str, path: &str) -> Result<DiffSummary, String> {
     let relative_path = Path::new(path);
     reject_reserved_project_path(relative_path)?;
@@ -6149,31 +6204,20 @@ fn revert_snapshot_file(root: &Path, run_id: &str, path: &str) -> Result<DiffSum
         .as_ref()
         .and_then(|summary| summary.prompt_preview.clone());
     let final_message = saved_summary.and_then(|summary| summary.final_message);
+    let scope_reverted_files = load_saved_diff_summary(root, run_id)
+        .map(|summary| summary.scope_reverted_files)
+        .unwrap_or_default();
     let current_summary = diff_snapshot(root, run_id)?;
     if !current_summary.changed_files.contains(&relative) {
         return Err(format!("{relative} 没有可撤回的 Codex 修改。"));
     }
 
-    let manifest = load_snapshot_manifest(root, run_id)?;
-    let before_files = manifest.files.into_iter().collect::<BTreeSet<_>>();
-    let snapshot_root = snapshot_root(root, run_id);
-    if before_files.contains(&relative) {
-        let source = snapshot_root.join(&relative);
-        let target = resolve_project_file_for_write(root, Path::new(&relative))?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|err| format!("failed to create project directory: {err}"))?;
-        }
-        fs::copy(&source, &target).map_err(|err| format!("failed to restore {relative}: {err}"))?;
-    } else {
-        let target = resolve_project_file_existing(root, Path::new(&relative))?;
-        fs::remove_file(&target)
-            .map_err(|err| format!("failed to remove new file {relative}: {err}"))?;
-    }
+    restore_snapshot_file_state(root, run_id, &relative)?;
 
     let mut next_summary = diff_snapshot(root, run_id)?;
     next_summary.prompt_preview = prompt_preview;
     next_summary.final_message = final_message;
+    next_summary.scope_reverted_files = scope_reverted_files;
     if next_summary.changed_files.is_empty() {
         let path = diff_summary_path(root, run_id);
         if path.exists() {
@@ -6213,6 +6257,7 @@ fn ensure_main_window_visible<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
 
 fn main() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             check_environment,
             create_project,
@@ -6220,9 +6265,6 @@ fn main() {
             get_project_settings,
             update_project_settings,
             list_recent_projects,
-            choose_project_folder,
-            choose_project_zip,
-            choose_import_files,
             import_project_zip,
             import_project_files,
             list_project_files,
@@ -7289,6 +7331,54 @@ mod tests {
     }
 
     #[test]
+    fn parses_bibtex_metadata_with_library_features_and_graceful_fallback() {
+        let content = r#"
+@string{conf = {NeurIPS}}
+
+@inproceedings{chen2026toc,
+  author = {Junzhe Chen and Siyuan Meng and Yuxi Chen and Man Zhao},
+  title = {{TOC}-{Bench}: Evaluating {Temporal} Object Consistency},
+  date = {2026-01},
+  booktitle = conf,
+}
+
+@article{zhao2025quoted,
+  author = "Zhao, Man and Gui, Wenyao",
+  title = "Nested {Video-LLM} Reasoning",
+  year = 2025,
+}
+"#;
+
+        let symbols = parse_bib_symbols("refs.bib", content);
+        let details = symbols
+            .iter()
+            .map(|symbol| (symbol.key.as_str(), symbol.detail.as_deref().unwrap_or("")))
+            .collect::<HashMap<_, _>>();
+
+        assert_eq!(symbols[0].line, 4);
+        assert_eq!(
+            details.get("chen2026toc").copied(),
+            Some(
+                "inproceedings · Chen et al. · 2026 · TOC-Bench: Evaluating Temporal Object Consistency",
+            )
+        );
+        assert_eq!(
+            details.get("zhao2025quoted").copied(),
+            Some("article · Zhao & Gui · 2025 · Nested Video-LLM Reasoning")
+        );
+
+        let malformed = "@article{kept2026,\n  title={Still indexed}\n\n@article{next2027,\n";
+        let fallback = parse_bib_symbols("broken.bib", malformed);
+        assert_eq!(
+            fallback
+                .iter()
+                .map(|symbol| (symbol.key.as_str(), symbol.detail.as_deref().unwrap_or("")))
+                .collect::<Vec<_>>(),
+            vec![("kept2026", "article"), ("next2027", "article")]
+        );
+    }
+
+    #[test]
     fn indexes_unresolved_project_references() {
         let temp = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
@@ -7605,20 +7695,18 @@ SyncTeX result end
     }
 
     #[test]
-    fn prepares_project_source_export_without_build_artifacts() {
+    fn exports_and_imports_project_zip_without_external_commands() {
         let temp = tempfile::tempdir().unwrap();
-        let root = fs::canonicalize(temp.path()).unwrap();
+        let root = temp.path().join("paper sample");
+        fs::create_dir_all(root.join("figures")).unwrap();
+        fs::create_dir_all(root.join(".latex-studio/build")).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(root.join("main.tex"), "main\n").unwrap();
         fs::write(root.join("references.bib"), "@article{x}\n").unwrap();
-        fs::write(root.join("main.aux"), "generated").unwrap();
+        fs::write(root.join("figures/diagram.pdf"), b"%PDF figure").unwrap();
         fs::write(root.join("main.log"), "generated").unwrap();
         fs::write(root.join("main.pdf"), "compiled").unwrap();
-        fs::write(root.join("old-export.zip"), "old").unwrap();
-        fs::create_dir_all(root.join("figures")).unwrap();
-        fs::write(root.join("figures/diagram.pdf"), b"%PDF figure").unwrap();
-        fs::create_dir_all(root.join(".latex-studio/build")).unwrap();
         fs::write(root.join(".latex-studio/build/main.pdf"), b"%PDF build").unwrap();
-        fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(root.join(".git/config"), "git").unwrap();
         write_json(
             &root.join(".latex-studio.json"),
@@ -7626,25 +7714,55 @@ SyncTeX result end
         )
         .unwrap();
 
-        let staging = tempfile::tempdir().unwrap();
-        copy_project_sources_for_export(
-            &root,
-            &ProjectSettings::default(),
-            staging.path(),
-            Some(&fs::canonicalize(root.join("old-export.zip")).unwrap()),
-        )
-        .unwrap();
+        let export_path = temp.path().join("paper-export.zip");
+        export_project_zip_to_path(&root, &ProjectSettings::default(), &export_path).unwrap();
+        validate_zip_archive_entries(&export_path).unwrap();
 
-        assert!(staging.path().join("main.tex").exists());
-        assert!(staging.path().join("references.bib").exists());
-        assert!(staging.path().join("figures/diagram.pdf").exists());
-        assert!(!staging.path().join("main.aux").exists());
-        assert!(!staging.path().join("main.log").exists());
-        assert!(!staging.path().join("main.pdf").exists());
-        assert!(!staging.path().join("old-export.zip").exists());
-        assert!(!staging.path().join(".latex-studio.json").exists());
-        assert!(!staging.path().join(".latex-studio/build/main.pdf").exists());
-        assert!(!staging.path().join(".git/config").exists());
+        let mut archive = open_zip_archive(&export_path).unwrap();
+        let mut names = Vec::new();
+        for index in 0..archive.len() {
+            names.push(archive.by_index(index).unwrap().name().to_string());
+        }
+        names.sort();
+        assert!(names.contains(&"paper-sample/main.tex".to_string()));
+        assert!(names.contains(&"paper-sample/references.bib".to_string()));
+        assert!(names.contains(&"paper-sample/figures/diagram.pdf".to_string()));
+        assert!(!names.iter().any(|name| name.contains(".latex-studio")));
+        assert!(!names.iter().any(|name| name.contains(".git")));
+        assert!(!names.iter().any(|name| name.ends_with("main.log")));
+        assert!(!names.iter().any(|name| name.ends_with("main.pdf")));
+        drop(archive);
+
+        let import_root = temp.path().join("imported paper");
+        import_project_zip_to_root(&export_path, &import_root).unwrap();
+        assert_eq!(
+            fs::read_to_string(import_root.join("main.tex")).unwrap(),
+            "main\n"
+        );
+        assert!(import_root.join("references.bib").exists());
+        assert!(import_root.join("figures/diagram.pdf").exists());
+        assert!(!import_root.join(".latex-studio.json").exists());
+        assert!(!import_root.join(".git/config").exists());
+        assert!(!import_root.join("main.log").exists());
+        assert!(!import_root.join("main.pdf").exists());
+    }
+
+    #[test]
+    fn rejects_unsafe_zip_archive_entries_before_import() {
+        let temp = tempfile::tempdir().unwrap();
+        let zip_path = temp.path().join("unsafe.zip");
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut writer = ZipWriter::new(file);
+        writer
+            .start_file("../evil.tex", SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"evil").unwrap();
+        writer.finish().unwrap();
+
+        assert!(validate_zip_archive_entries(&zip_path).is_err());
+        let import_root = temp.path().join("imported");
+        assert!(import_project_zip_to_root(&zip_path, &import_root).is_err());
+        assert!(!import_root.exists());
     }
 
     #[test]
@@ -7762,6 +7880,7 @@ SyncTeX result end
             changed_files: vec!["main.tex".to_string()],
             unified_diff: "diff a".to_string(),
             can_revert: true,
+            scope_reverted_files: Vec::new(),
             prompt_preview: Some("Polish the introduction".to_string()),
             final_message: Some("Polished the opening paragraph.".to_string()),
         };
@@ -7770,6 +7889,7 @@ SyncTeX result end
             changed_files: vec!["sections/intro.tex".to_string()],
             unified_diff: "diff b".to_string(),
             can_revert: true,
+            scope_reverted_files: Vec::new(),
             prompt_preview: None,
             final_message: None,
         };
@@ -8000,6 +8120,7 @@ echo 'fake latexmk ok'
                 project_root: root.to_string_lossy().to_string(),
                 prompt: "Add a QA notes section.".to_string(),
                 auto_compile: Some(true),
+                allowed_files: None,
             },
             Some(fake_codex),
             Some(fake_latexmk),
@@ -8023,6 +8144,124 @@ echo 'fake latexmk ok'
         let reverted = fs::read_to_string(root.join("main.tex")).unwrap();
         assert!(reverted.contains("Original"));
         assert!(!reverted.contains("QA Notes"));
+    }
+
+    #[test]
+    fn codex_allowed_file_scope_reverts_out_of_scope_changes_before_compile() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        fs::create_dir_all(root.join("sections")).unwrap();
+        fs::write(
+            root.join("main.tex"),
+            "\\documentclass{article}\n\\begin{document}\nOriginal\n\\end{document}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("sections/method.tex"),
+            "Method stays unchanged.\n",
+        )
+        .unwrap();
+        write_json(
+            &root.join(".latex-studio.json"),
+            &ProjectSettings::default(),
+        )
+        .unwrap();
+
+        let fake_codex = root.join("codex-scope.sh");
+        let mut codex_file = fs::File::create(&fake_codex).unwrap();
+        write!(
+            codex_file,
+            "{}",
+            r#"#!/bin/sh
+last_message=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output-last-message" ]; then
+    shift
+    last_message="$1"
+  fi
+  shift
+done
+if [ -z "$last_message" ]; then
+  echo "missing --output-last-message" >&2
+  exit 42
+fi
+printf '%s\n' '{"type":"thread.started"}'
+printf '%s\n' '{"type":"turn.started"}'
+tmp="main.tex.tmp"
+while IFS= read -r line; do
+  if [ "$line" = '\end{document}' ]; then
+    printf '%s\n' '\section{Allowed Scope}' 'Only this file should remain changed.'
+  fi
+  printf '%s\n' "$line"
+done < main.tex > "$tmp"
+mv "$tmp" main.tex
+printf '%s\n' 'OUT OF SCOPE' > sections/method.tex
+printf '%s\n' 'OUT OF SCOPE NEW FILE' > extra.tex
+printf '%s\n' 'Changed one allowed file and one disallowed file.' > "$last_message"
+printf '%s\n' '{"type":"turn.completed"}'
+"#
+        )
+        .unwrap();
+        make_executable(&fake_codex);
+
+        let fake_latexmk = root.join("latexmk-scope.sh");
+        let mut latexmk_file = fs::File::create(&fake_latexmk).unwrap();
+        write!(
+            latexmk_file,
+            "{}",
+            r#"#!/bin/sh
+if grep -q 'OUT OF SCOPE' sections/method.tex; then
+  echo "scope enforcement did not run before compile" >&2
+  exit 44
+fi
+outdir=""
+main="main.tex"
+for arg in "$@"; do
+  case "$arg" in
+    -outdir=*) outdir="${arg#-outdir=}" ;;
+    *.tex) main="$arg" ;;
+  esac
+done
+mkdir -p "$outdir"
+stem="${main%.tex}"
+printf '%s\n' '%PDF-1.4 fake' > "$outdir/$stem.pdf"
+echo 'fake latexmk ok'
+"#
+        )
+        .unwrap();
+        make_executable(&fake_latexmk);
+
+        let summary = run_codex_edit_blocking_with_tools(
+            None,
+            CodexRunRequest {
+                project_root: root.to_string_lossy().to_string(),
+                prompt: "Only update main.tex.".to_string(),
+                auto_compile: Some(true),
+                allowed_files: Some(vec!["main.tex".to_string()]),
+            },
+            Some(fake_codex),
+            Some(fake_latexmk),
+        )
+        .unwrap();
+
+        assert_eq!(summary.changed_files, vec!["main.tex".to_string()]);
+        assert_eq!(
+            summary.scope_reverted_files,
+            vec!["extra.tex".to_string(), "sections/method.tex".to_string()]
+        );
+        assert!(summary.unified_diff.contains("+\\section{Allowed Scope}"));
+        assert!(fs::read_to_string(root.join("main.tex"))
+            .unwrap()
+            .contains("\\section{Allowed Scope}"));
+        assert_eq!(
+            fs::read_to_string(root.join("sections/method.tex")).unwrap(),
+            "Method stays unchanged.\n"
+        );
+        assert!(!root.join("extra.tex").exists());
+        assert!(root.join(".latex-studio/build/main.pdf").exists());
+
+        let saved = load_saved_diff_summary(&root, &summary.run_id).unwrap();
+        assert_eq!(saved.scope_reverted_files, summary.scope_reverted_files);
     }
 
     #[test]
@@ -8085,6 +8324,7 @@ printf '%s\n' ran > latexmk-was-run.txt
                 project_root: root.to_string_lossy().to_string(),
                 prompt: "Do not change anything.".to_string(),
                 auto_compile: Some(true),
+                allowed_files: None,
             },
             Some(fake_codex),
             Some(fake_latexmk),

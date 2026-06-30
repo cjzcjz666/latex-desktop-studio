@@ -19,9 +19,22 @@ const compiled = ts.transpileModule(source, {
 const tempDir = mkdtempSync(join(tmpdir(), "latex-studio-editor-logic-"));
 const modulePath = join(tempDir, "editorLogic.mjs");
 writeFileSync(modulePath, compiled.outputText, "utf8");
+const codexContextSourcePath = new URL("../src/lib/codexContext.ts", import.meta.url);
+const codexContextSource = readFileSync(codexContextSourcePath, "utf8");
+const compiledCodexContext = ts.transpileModule(codexContextSource, {
+  compilerOptions: {
+    module: ts.ModuleKind.ES2020,
+    target: ts.ScriptTarget.ES2020,
+    importsNotUsedAsValues: ts.ImportsNotUsedAsValues.Remove,
+  },
+  fileName: "codexContext.ts",
+});
+const codexContextModulePath = join(tempDir, "codexContext.mjs");
+writeFileSync(codexContextModulePath, compiledCodexContext.outputText, "utf8");
 
 try {
   const logic = await import(pathToFileURL(modulePath).href);
+  const codexContext = await import(pathToFileURL(codexContextModulePath).href);
 
   assert.equal(logic.normalizeShortcutInput("Cmd + Shift + m"), "⌘⇧M");
   assert.equal(logic.normalizeShortcutInput("ctrl+enter"), "⌃↵");
@@ -51,6 +64,57 @@ try {
   assert.equal(logic.parseLatexTodoCommentText("REVIEW-END"), null);
   assert.equal(logic.isReviewEndCommentLine("% REVIEW-END"), true);
   assert.equal(logic.isReviewEndCommentLine(String.raw`Text \% REVIEW-END`), false);
+  assert.equal(
+    logic.formatCodexAnswerReviewComment("Add motivation.\nCheck citation.", "  ", "\\section{Intro}\n"),
+    [
+      "  % REVIEW: Codex 建议",
+      "  % Add motivation.",
+      "  % Check citation.",
+      "\\section{Intro}",
+      "  % REVIEW-END",
+      "",
+    ].join("\n"),
+  );
+  assert.equal(logic.formatCodexAnswerReviewComment("   "), "");
+
+  const editorContext = {
+    source: "editor",
+    file: "sections/intro.tex",
+    cursorLine: 12,
+    cursorColumn: 4,
+    activeSection: { kind: "section", title: "Introduction", line: 1, level: 2 },
+    selectedText: "Selected paragraph.",
+    selectedCharCount: 19,
+    selectionStartLine: 10,
+    selectionEndLine: 11,
+    truncated: false,
+    nearbyStartLine: 6,
+    nearbyEndLine: 18,
+    nearbyText: "Nearby source.",
+    nearbyTruncated: false,
+  };
+  assert.equal(
+    codexContext.formatCodexContextHint(editorContext),
+    "sections/intro.tex:10-11 · 选区 19 字 · SEC Introduction",
+  );
+  assert.equal(codexContext.codexContextKindLabel(editorContext, true), "锁定选区");
+  assert.deepEqual(codexContext.codexContextLineRange(editorContext), { startLine: 10, endLine: 11 });
+  assert.deepEqual(codexContext.codexContextSource(editorContext), { text: "Selected paragraph.", startLine: 10 });
+
+  const diffHunkContext = {
+    ...editorContext,
+    source: "diff-hunk",
+    selectionStartLine: 20,
+    selectionEndLine: 20,
+    selectedText: "\\section{Revised}",
+    selectedCharCount: 17,
+  };
+  assert.equal(
+    codexContext.formatCodexContextHint(diffHunkContext),
+    "sections/intro.tex:20 · Codex 片段 · SEC Introduction",
+  );
+  assert.equal(codexContext.codexContextKindLabel(diffHunkContext), "片段");
+  assert.equal(codexContext.codexContextKindLabel(diffHunkContext, true), "锁定片段");
 
   const diff = [
     "--- a/main.tex",
@@ -75,6 +139,52 @@ try {
     ],
   );
   assert.equal(logic.formatParsedDiffFile(files[0]), diff);
+  const hunks = logic.parsedDiffHunks(files[0]);
+  assert.equal(hunks.length, 1);
+  assert.deepEqual(
+    hunks.map((hunk) => [hunk.header, hunk.oldStart ?? null, hunk.newStart ?? null, hunk.added, hunk.removed]),
+    [["@@ -2,2 +2,3 @@", 2, 2, 2, 1]],
+  );
+  assert.equal(logic.formatParsedDiffHunk(files[0], hunks[0]), diff);
+  assert.equal(logic.codexDiffHunkKey(files[0].file, hunks[0]), logic.codexDiffHunkKey(files[0].file, hunks[0]));
+  assert.notEqual(logic.codexDiffHunkKey(files[0].file, hunks[0]), logic.codexDiffHunkKey("other.tex", hunks[0]));
+  assert.deepEqual(logic.codexDiffHunkReviewStats(diff), {
+    totalHunks: 1,
+    acceptedHunks: 0,
+    pendingHunks: 1,
+  });
+  assert.deepEqual(logic.codexDiffHunkReviewStats(diff, [logic.codexDiffHunkKey(files[0].file, hunks[0])]), {
+    totalHunks: 1,
+    acceptedHunks: 1,
+    pendingHunks: 0,
+  });
+  assert.equal(
+    logic.revertParsedDiffHunkInContent("title\ncontext\nnew text\nextra line\nend\n", hunks[0]),
+    "title\ncontext\nold text\nend\n",
+  );
+  assert.equal(
+    logic.revertParsedDiffHunkInContent("title\r\ncontext\r\nnew text\r\nextra line\r\nend\r\n", hunks[0]),
+    "title\r\ncontext\r\nold text\r\nend\r\n",
+  );
+
+  const deletionDiff = [
+    "--- a/main.tex",
+    "+++ b/main.tex",
+    "@@ -1,4 +1,3 @@",
+    " before",
+    "-deleted",
+    " after",
+    " end",
+  ].join("\n");
+  const deletionHunk = logic.parsedDiffHunks(logic.parseUnifiedDiff(deletionDiff)[0])[0];
+  assert.equal(
+    logic.revertParsedDiffHunkInContent("before\nafter\nend\n", deletionHunk),
+    "before\ndeleted\nafter\nend\n",
+  );
+  assert.throws(
+    () => logic.revertParsedDiffHunkInContent("before\nchanged\nend\n", deletionHunk),
+    /无法在当前文件中定位/,
+  );
 
   assert.deepEqual(
     logic.resolveCodexFileMentionPaths(

@@ -12,6 +12,15 @@ export type ParsedDiffFile = {
   lines: ParsedDiffLine[];
 };
 
+export type ParsedDiffHunk = {
+  header: string;
+  lines: ParsedDiffLine[];
+  oldStart?: number;
+  newStart?: number;
+  added: number;
+  removed: number;
+};
+
 export function normalizeShortcutInput(value: string) {
   const tokens = value
     .trim()
@@ -180,6 +189,22 @@ export function isReviewEndCommentLine(line: string) {
   return commentStart >= 0 && isReviewEndCommentText(line.slice(commentStart + 1));
 }
 
+export function formatCodexAnswerReviewComment(answer: string, indent = "", selectedText = "") {
+  const normalizedAnswer = answer.trim().replace(/\r\n?/g, "\n");
+  if (!normalizedAnswer) return "";
+  const commentLines = normalizedAnswer.split("\n").map((line) => `${indent}% ${line.trimEnd()}`);
+  const selectedBlock = selectedText
+    ? [selectedText.endsWith("\n") ? selectedText.slice(0, -1) : selectedText]
+    : [];
+  return [
+    `${indent}% REVIEW: Codex 建议`,
+    ...commentLines,
+    ...selectedBlock,
+    `${indent}% REVIEW-END`,
+    "",
+  ].join("\n");
+}
+
 export function parseUnifiedDiff(diff: string): ParsedDiffFile[] {
   const files: ParsedDiffFile[] = [];
   let current: ParsedDiffFile | null = null;
@@ -233,11 +258,133 @@ export function formatParsedDiffFile(file: ParsedDiffFile) {
   ].join("\n");
 }
 
+export function parsedDiffHunks(file: ParsedDiffFile): ParsedDiffHunk[] {
+  const hunks: ParsedDiffHunk[] = [];
+  let current: ParsedDiffHunk | null = null;
+  for (const line of file.lines) {
+    if (line.kind === "meta") {
+      current = {
+        header: line.content,
+        lines: [],
+        oldStart: parseHunkStart(line.content, "-") || undefined,
+        newStart: parseNewHunkStart(line.content) || undefined,
+        added: 0,
+        removed: 0,
+      };
+      hunks.push(current);
+      continue;
+    }
+    if (!current) {
+      current = {
+        header: "整体变化",
+        lines: [],
+        added: 0,
+        removed: 0,
+      };
+      hunks.push(current);
+    }
+    current.lines.push(line);
+    if (line.kind === "add") current.added += 1;
+    if (line.kind === "remove") current.removed += 1;
+  }
+  return hunks.filter((hunk) => hunk.lines.length > 0 || hunk.header !== "整体变化");
+}
+
+export function formatParsedDiffHunk(file: ParsedDiffFile, hunk: ParsedDiffHunk) {
+  return [
+    `--- a/${file.file}`,
+    `+++ b/${file.file}`,
+    hunk.header,
+    ...hunk.lines.map(formatParsedDiffLineForCopy),
+  ].join("\n");
+}
+
+export function codexDiffHunkKey(file: string, hunk: ParsedDiffHunk) {
+  return [
+    file,
+    hunk.header,
+    ...hunk.lines.map((line) => `${line.kind}:${line.oldLine ?? ""}:${line.newLine ?? ""}:${line.content}`),
+  ].join("\u001f");
+}
+
+export function codexDiffHunkReviewStats(diff: string, acceptedHunkKeys: string[] = []) {
+  const accepted = new Set(acceptedHunkKeys);
+  let totalHunks = 0;
+  let acceptedHunks = 0;
+  for (const file of parseUnifiedDiff(diff)) {
+    for (const hunk of parsedDiffHunks(file)) {
+      totalHunks += 1;
+      if (accepted.has(codexDiffHunkKey(file.file, hunk))) {
+        acceptedHunks += 1;
+      }
+    }
+  }
+  return {
+    totalHunks,
+    acceptedHunks,
+    pendingHunks: Math.max(0, totalHunks - acceptedHunks),
+  };
+}
+
+export function revertParsedDiffHunkInContent(content: string, hunk: ParsedDiffHunk) {
+  const { lines, eol, hasFinalNewline } = splitContentForDiffPatch(content);
+  const currentHunkLines = hunk.lines.filter((line) => line.kind !== "remove").map((line) => line.content);
+  const previousHunkLines = hunk.lines.filter((line) => line.kind !== "add").map((line) => line.content);
+  if (!currentHunkLines.length && !previousHunkLines.length) return content;
+  const startIndex = locateDiffHunkInLines(lines, currentHunkLines, hunk.newStart);
+  if (startIndex < 0) {
+    throw new Error("无法在当前文件中定位这个 Codex 修改片段，文件可能已被手动改动。");
+  }
+  const nextLines = [
+    ...lines.slice(0, startIndex),
+    ...previousHunkLines,
+    ...lines.slice(startIndex + currentHunkLines.length),
+  ];
+  return joinContentFromDiffPatch(nextLines, eol, hasFinalNewline);
+}
+
 export function formatParsedDiffLineForCopy(line: ParsedDiffLine) {
   if (line.kind === "add") return `+${line.content}`;
   if (line.kind === "remove") return `-${line.content}`;
   if (line.kind === "context") return ` ${line.content}`;
   return line.content;
+}
+
+function splitContentForDiffPatch(content: string) {
+  const eol = content.includes("\r\n") ? "\r\n" : "\n";
+  const normalized = content.replace(/\r\n?/g, "\n");
+  const hasFinalNewline = normalized.endsWith("\n");
+  const lines = normalized.split("\n");
+  if (hasFinalNewline) lines.pop();
+  return { lines, eol, hasFinalNewline };
+}
+
+function joinContentFromDiffPatch(lines: string[], eol: string, hasFinalNewline: boolean) {
+  return `${lines.join(eol)}${hasFinalNewline ? eol : ""}`;
+}
+
+function locateDiffHunkInLines(lines: string[], hunkLines: string[], newStart?: number) {
+  if (!hunkLines.length) {
+    return Math.min(Math.max((newStart ?? 1) - 1, 0), lines.length);
+  }
+  const preferredStart = typeof newStart === "number" ? Math.max(0, newStart - 1) : 0;
+  const candidates = new Set<number>([preferredStart]);
+  for (let offset = 1; offset <= 8; offset += 1) {
+    candidates.add(preferredStart - offset);
+    candidates.add(preferredStart + offset);
+  }
+  for (const start of candidates) {
+    if (lineSequenceMatches(lines, start, hunkLines)) return start;
+  }
+  for (let start = 0; start <= lines.length - hunkLines.length; start += 1) {
+    if (lineSequenceMatches(lines, start, hunkLines)) return start;
+  }
+  return -1;
+}
+
+function lineSequenceMatches(lines: string[], start: number, sequence: string[]) {
+  if (start < 0 || start + sequence.length > lines.length) return false;
+  return sequence.every((line, index) => lines[start + index] === line);
 }
 
 export function resolveCodexFileMentionPaths(prompt: string, projectFiles: string[], maxFiles = 6) {
