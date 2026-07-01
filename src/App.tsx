@@ -65,8 +65,12 @@ import { CodexAnswerView } from "./components/CodexAnswerView";
 import { CodexContextStrip } from "./components/CodexContextStrip";
 import { CodexDiffView } from "./components/CodexDiffView";
 import { CodexHistoryList } from "./components/CodexHistoryList";
+import { CodexMentionMenu, type CodexMentionSuggestion } from "./components/CodexMentionMenu";
 import { CodexProgressView } from "./components/CodexProgressView";
+import { CompileErrorPanel } from "./components/CompileErrorPanel";
 import { FileTreeNode } from "./components/FileTreeNode";
+import { SafetyConfirmDialog, type SafetyConfirmDialogRequest } from "./components/SafetyConfirmDialog";
+import { ToolPill } from "./components/ToolPill";
 import {
   codexContextKindLabel,
   codexContextLineRange,
@@ -94,6 +98,13 @@ import {
   type ParsedDiffHunk,
   type ParsedDiffLine,
 } from "./lib/editorLogic";
+import {
+  diagnosticInstallCommand,
+  diagnosticSeverityLabel,
+  formatDiagnosticLocation,
+  formatDiagnosticText,
+  tailLog,
+} from "./lib/diagnostics";
 import {
   configureMonacoLatexTheme,
   languageForPath,
@@ -427,6 +438,11 @@ type PendingEditorInsertion = {
   status: string;
 };
 
+type PendingSafetyConfirm = SafetyConfirmDialogRequest & {
+  onConfirm: () => Promise<void> | void;
+  onSaveAndConfirm?: () => Promise<void> | void;
+};
+
 type BibEntryDraft = {
   targetFile: string;
   entryType: "article" | "inproceedings" | "misc";
@@ -467,13 +483,6 @@ type CodexMentionQuery = {
   query: string;
   start: number;
   end: number;
-};
-
-type CodexMentionSuggestion = {
-  kind: "file" | "label" | "citation";
-  value: string;
-  title: string;
-  detail: string;
 };
 
 type AutoSaveState = "idle" | "saving" | "saved" | "error";
@@ -624,6 +633,7 @@ export function App() {
   const [isCompiling, setIsCompiling] = useState(false);
   const [isCodexRunning, setIsCodexRunning] = useState(false);
   const [isCodexCancelling, setIsCodexCancelling] = useState(false);
+  const [isEnvironmentChecking, setIsEnvironmentChecking] = useState(false);
   const [codexRunMode, setCodexRunMode] = useState<CodexRunMode>("edit");
   const [status, setStatus] = useState("就绪");
   const [pendingLine, setPendingLine] = useState<number | null>(null);
@@ -687,6 +697,8 @@ export function App() {
   const [isGoToLineOpen, setIsGoToLineOpen] = useState(false);
   const [goToLineValue, setGoToLineValue] = useState("");
   const [pendingCloseTabPath, setPendingCloseTabPath] = useState<string | null>(null);
+  const [pendingSafetyConfirm, setPendingSafetyConfirm] = useState<PendingSafetyConfirm | null>(null);
+  const [isSafetyConfirming, setIsSafetyConfirming] = useState(false);
   const workspaceRef = useRef<HTMLElement | null>(null);
   const editorPanelRef = useRef<HTMLElement | null>(null);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
@@ -1113,12 +1125,19 @@ export function App() {
         const blockers = exitBlockers();
         if (!blockers.length) return;
         event.preventDefault();
-        const confirmed = window.confirm(
-          `关闭 LaTeX Studio 前请确认：\n\n${blockers.map((item) => `- ${item}`).join("\n")}\n\n仍然关闭吗？`,
-        );
-        if (confirmed) {
-          void getCurrentWindow().destroy();
-        }
+        setPendingSafetyConfirm({
+          kind: "close-app",
+          blockers,
+          onConfirm: async () => {
+            await getCurrentWindow().destroy();
+          },
+          onSaveAndConfirm: dirtyTabsSnapshot().length
+            ? async () => {
+                await saveOpenTabsWithHistory("手动保存");
+                await getCurrentWindow().destroy();
+              }
+            : undefined,
+        });
       })
       .then((unlisten) => {
         if (mounted) {
@@ -1165,6 +1184,17 @@ export function App() {
       window.removeEventListener("keydown", handlePopoverKeyDown, true);
     };
   }, [showProjectPanel, showSettingsPanel]);
+
+  useEffect(() => {
+    if (!pendingSafetyConfirm) return;
+    const handleSafetyDialogKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || isSafetyConfirming) return;
+      event.preventDefault();
+      setPendingSafetyConfirm(null);
+    };
+    window.addEventListener("keydown", handleSafetyDialogKeyDown);
+    return () => window.removeEventListener("keydown", handleSafetyDialogKeyDown);
+  }, [pendingSafetyConfirm, isSafetyConfirming]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -2020,6 +2050,10 @@ export function App() {
   }, [codexMentionIndex, codexMentionSuggestions.length]);
   const selectedEngine = draftSettings?.engine ?? projectSettings?.engine ?? "xelatex";
   const selectedEngineStatus = environment ? engineStatus(environment, selectedEngine) : undefined;
+  const environmentTools = environment
+    ? [environment.latexmk, environment.xelatex, environment.pdflatex, environment.lualatex, environment.codex]
+    : [];
+  const missingEnvironmentTools = environmentTools.filter((tool) => !tool.found);
   const pdfPath = compileResult?.success ? compileResult.pdfPath : undefined;
   const showEditor = viewMode !== "preview";
   const showPreview = viewMode !== "editor";
@@ -2232,6 +2266,35 @@ export function App() {
       todos: nextTodos,
       referenceIssues: nextReferenceIssues,
     };
+  }
+
+  async function handleRefreshEnvironment() {
+    setIsEnvironmentChecking(true);
+    setStatus("正在重新检测本地 LaTeX / Codex 环境...");
+    try {
+      const nextEnvironment = await checkEnvironment();
+      setEnvironment(nextEnvironment);
+      if (nextEnvironment.canCompile && nextEnvironment.canRunCodex) {
+        setStatus("本地 LaTeX 编译和 Codex 环境均可用。");
+      } else if (!nextEnvironment.canCompile && !nextEnvironment.canRunCodex) {
+        setStatus("未检测到完整 LaTeX 编译环境和 Codex CLI。");
+      } else if (!nextEnvironment.canCompile) {
+        setStatus("未检测到完整 LaTeX 编译环境。");
+      } else {
+        setStatus("未检测到 Codex CLI。");
+      }
+    } finally {
+      setIsEnvironmentChecking(false);
+    }
+  }
+
+  function openEnvironmentSettings(message: string) {
+    if (projectSettings) {
+      setDraftSettings(projectSettings);
+    }
+    setShowProjectPanel(false);
+    setShowSettingsPanel(true);
+    setStatus(message);
   }
 
   async function readProjectPreambleContext(root: string, mainFile?: string) {
@@ -2621,45 +2684,60 @@ export function App() {
     setShowProjectPanel(false);
   }
 
-  async function handleCreateProject(input?: string) {
-    if (!confirmDiscardUnsavedTabs("新建项目")) return;
-    const nextProject = await createProject((input ?? newProjectName).trim(), undefined, newProjectTemplate);
+  async function createProjectNow(input: string, template: ProjectTemplate) {
+    const nextProject = await createProject(input, undefined, template);
     setNewProjectName("");
     await activateProject(nextProject, "项目已创建。");
   }
 
+  async function handleCreateProject(input?: string) {
+    const projectName = (input ?? newProjectName).trim();
+    const template = newProjectTemplate;
+    if (requestDiscardUnsavedTabs("新建项目", () => createProjectNow(projectName, template))) return;
+    await createProjectNow(projectName, template);
+  }
+
+  async function openProjectNow(path: string, message = "项目已打开。") {
+    const nextProject = await openProject(path);
+    await activateProject(nextProject, message);
+  }
+
   async function handleOpenProject() {
-    if (!confirmDiscardUnsavedTabs("打开项目")) return;
-    if (!projectPath.trim()) {
+    const path = projectPath.trim();
+    if (!path) {
       setStatus("请先输入项目文件夹路径。");
       return;
     }
-    const nextProject = await openProject(projectPath.trim());
-    await activateProject(nextProject, "项目已打开。");
+    if (requestDiscardUnsavedTabs("打开项目", () => openProjectNow(path))) return;
+    await openProjectNow(path);
   }
 
   async function handleChooseProjectFolder() {
-    if (!confirmDiscardUnsavedTabs("打开项目")) return;
-    const selected = await chooseProjectFolder();
-    if (!selected) return;
-    setProjectPath(selected);
-    const nextProject = await openProject(selected);
-    await activateProject(nextProject, "项目已打开。");
+    const chooseAndOpen = async () => {
+      const selected = await chooseProjectFolder();
+      if (!selected) return;
+      setProjectPath(selected);
+      await openProjectNow(selected);
+    };
+    if (requestDiscardUnsavedTabs("打开项目", chooseAndOpen)) return;
+    await chooseAndOpen();
   }
 
   async function handleImportProjectZip() {
-    if (!confirmDiscardUnsavedTabs("导入 ZIP 项目")) return;
-    const selected = await chooseProjectZip();
-    if (!selected) return;
-    setStatus("正在导入 ZIP 项目...");
-    const nextProject = await importProjectZip(selected);
-    await activateProject(nextProject, "ZIP 项目已导入。");
+    const chooseAndImport = async () => {
+      const selected = await chooseProjectZip();
+      if (!selected) return;
+      setStatus("正在导入 ZIP 项目...");
+      const nextProject = await importProjectZip(selected);
+      await activateProject(nextProject, "ZIP 项目已导入。");
+    };
+    if (requestDiscardUnsavedTabs("导入 ZIP 项目", chooseAndImport)) return;
+    await chooseAndImport();
   }
 
   async function handleOpenRecentProject(recent: RecentProject) {
-    if (!confirmDiscardUnsavedTabs("切换项目")) return;
-    const nextProject = await openProject(recent.root);
-    await activateProject(nextProject, "项目已打开。");
+    if (requestDiscardUnsavedTabs("切换项目", () => openProjectNow(recent.root))) return;
+    await openProjectNow(recent.root);
   }
 
   async function handleSaveProjectSettings() {
@@ -3130,11 +3208,20 @@ export function App() {
   }
 
   async function handleCompile() {
+    if (!project) return;
+    if (environment?.canCompile === false) {
+      openEnvironmentSettings("缺少 LaTeX 编译环境。请在设置中查看本地环境并重新检测。");
+      return;
+    }
     await compileActiveProject("manual");
   }
 
   async function handleCompileFromScratch() {
     if (!project) return;
+    if (environment?.canCompile === false) {
+      openEnvironmentSettings("缺少 LaTeX 编译环境。请在设置中查看本地环境并重新检测。");
+      return;
+    }
     await saveOpenTabsWithHistory("编译前保存");
     setStatus("正在清理构建缓存并从零编译...");
     await cleanProjectBuild(project.root);
@@ -5135,10 +5222,41 @@ export function App() {
     return blockers;
   }
 
-  function confirmDiscardUnsavedTabs(action: string) {
+  function requestDiscardUnsavedTabs(action: string, onConfirm: () => Promise<void> | void) {
     const count = dirtyTabsSnapshot().length;
-    if (!count) return true;
-    return window.confirm(`还有 ${count} 个文件未保存，${action}会丢弃这些修改。确定继续吗？`);
+    if (!count) return false;
+    setPendingSafetyConfirm({
+      kind: "discard-unsaved",
+      action,
+      dirtyCount: count,
+      onConfirm,
+      onSaveAndConfirm: async () => {
+        await saveOpenTabsWithHistory("手动保存");
+        await onConfirm();
+      },
+    });
+    return true;
+  }
+
+  async function handleConfirmSafetyDialog(mode: "discard" | "save") {
+    const pending = pendingSafetyConfirm;
+    if (!pending) return;
+    setIsSafetyConfirming(true);
+    try {
+      setPendingSafetyConfirm(null);
+      if (mode === "save" && pending.onSaveAndConfirm) {
+        await pending.onSaveAndConfirm();
+      } else {
+        await pending.onConfirm();
+      }
+    } finally {
+      setIsSafetyConfirming(false);
+    }
+  }
+
+  function handleCancelSafetyDialog() {
+    if (isSafetyConfirming) return;
+    setPendingSafetyConfirm(null);
   }
 
   const viewModeLabel = viewMode === "editor" ? "编辑" : viewMode === "preview" ? "预览" : "分屏";
@@ -5154,6 +5272,17 @@ export function App() {
 
   return (
     <div className="app-shell">
+      <SafetyConfirmDialog
+        request={pendingSafetyConfirm}
+        isConfirming={isSafetyConfirming}
+        onCancel={handleCancelSafetyDialog}
+        onDiscardAndConfirm={() => void runSafely(() => handleConfirmSafetyDialog("discard"))}
+        onSaveAndConfirm={
+          pendingSafetyConfirm?.onSaveAndConfirm
+            ? () => void runSafely(() => handleConfirmSafetyDialog("save"))
+            : undefined
+        }
+      />
       {isQuickOpenVisible && (
         <div
           className="quick-open-overlay"
@@ -5247,13 +5376,23 @@ export function App() {
         <div className="project-actions project-actions-minimal">
           <button
             type="button"
-            className="primary-button topbar-compile-button"
+            className={[
+              "primary-button",
+              "topbar-compile-button",
+              environment?.canCompile === false ? "topbar-compile-button-setup" : "",
+            ]
+              .filter(Boolean)
+              .join(" ")}
             onClick={() => void runSafely(handleCompile)}
-            disabled={!project || isCompiling || !environment?.canCompile}
-            title={`编译 (${shortcuts.compile})`}
+            disabled={!project || isCompiling}
+            title={
+              environment?.canCompile === false
+                ? "配置 LaTeX 编译环境"
+                : `编译 (${shortcuts.compile})`
+            }
           >
             <Play size={16} />
-            <span>{isCompiling ? "编译中" : "编译"}</span>
+            <span>{environment?.canCompile === false ? "配置" : isCompiling ? "编译中" : "编译"}</span>
           </button>
           <button
             type="button"
@@ -5719,6 +5858,42 @@ export function App() {
                 <AlertTriangle size={16} />
                 <span>{selectedEngineStatus.installHint ?? `未检测到 ${selectedEngine}。`}</span>
               </div>
+            )}
+            {environment && (
+              <section className="settings-environment" aria-label="本地环境状态">
+                <div className="settings-environment-heading">
+                  <div>
+                    <strong>本地环境</strong>
+                    <span>
+                      {environment.canCompile && environment.canRunCodex
+                        ? "LaTeX 编译和 Codex 均可用。"
+                        : "缺少工具时，编辑仍可继续；相关功能会暂时不可用。"}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void runSafely(handleRefreshEnvironment)}
+                    disabled={isEnvironmentChecking}
+                  >
+                    {isEnvironmentChecking ? "检测中" : "重新检测"}
+                  </button>
+                </div>
+                <div className="settings-tool-grid">
+                  {environmentTools.map((tool) => (
+                    <ToolPill tool={tool} key={tool.name} />
+                  ))}
+                </div>
+                {missingEnvironmentTools.length > 0 && (
+                  <div className="settings-environment-hints">
+                    <strong>安装提示</strong>
+                    {missingEnvironmentTools.map((tool) => (
+                      <span key={tool.name}>
+                        {tool.name}: {tool.installHint ?? "未检测到该工具，请确认已安装并加入 PATH。"}
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </section>
             )}
             <section className="settings-toggles" aria-label="自动行为设置">
               <div className="settings-toggles-heading">
@@ -6346,6 +6521,8 @@ export function App() {
                     event.preventDefault();
                     if (canSubmitCodexPrompt) {
                       void runSafely(handleRunCodex);
+                    } else if (project && environment?.canRunCodex === false) {
+                      openEnvironmentSettings("缺少 Codex CLI。请在设置中查看本地环境并重新检测。");
                     }
                   }}
                 >
@@ -6372,48 +6549,48 @@ export function App() {
                       onOpenSymbol={(symbol) => void runSafely(() => handleOpenCodexContextSymbol(symbol))}
                       onRemoveMention={handleRemoveCodexPromptMention}
                     />
-	                    <textarea
-	                      ref={codexPromptInputRef}
-	                      value={codexPrompt}
-	                      onChange={(event) => handleCodexPromptChange(event.currentTarget)}
-	                      onFocus={(event) => {
-	                        setIsCodexPromptFocused(true);
-	                        syncCodexPromptCursor(event.currentTarget);
-	                      }}
-	                      onBlur={() => setIsCodexPromptFocused(false)}
-	                      onClick={(event) => syncCodexPromptCursor(event.currentTarget)}
-	                      onKeyUp={(event) => syncCodexPromptCursor(event.currentTarget)}
-	                      onSelect={(event) => syncCodexPromptCursor(event.currentTarget)}
-	                      onKeyDown={(event) => {
-	                        if (event.nativeEvent.isComposing) return;
-	                        if (codexMentionSuggestions.length) {
-	                          if (event.key === "ArrowDown") {
-	                            event.preventDefault();
-	                            setCodexMentionIndex((value) => (value + 1) % codexMentionSuggestions.length);
-	                            return;
-	                          }
-	                          if (event.key === "ArrowUp") {
-	                            event.preventDefault();
-	                            setCodexMentionIndex(
-	                              (value) => (value - 1 + codexMentionSuggestions.length) % codexMentionSuggestions.length,
-	                            );
-	                            return;
-	                          }
-	                          if (
-	                            event.key === "Tab" ||
-	                            (event.key === "Enter" &&
-	                              !event.shiftKey &&
-	                              !event.altKey &&
-	                              !event.metaKey &&
-	                              !event.ctrlKey)
-	                          ) {
-	                            event.preventDefault();
-	                            handleInsertCodexMention();
-	                            return;
-	                          }
-	                        }
-	                        if (
-	                          event.key === "Enter" &&
+                    <textarea
+                      ref={codexPromptInputRef}
+                      value={codexPrompt}
+                      onChange={(event) => handleCodexPromptChange(event.currentTarget)}
+                      onFocus={(event) => {
+                        setIsCodexPromptFocused(true);
+                        syncCodexPromptCursor(event.currentTarget);
+                      }}
+                      onBlur={() => setIsCodexPromptFocused(false)}
+                      onClick={(event) => syncCodexPromptCursor(event.currentTarget)}
+                      onKeyUp={(event) => syncCodexPromptCursor(event.currentTarget)}
+                      onSelect={(event) => syncCodexPromptCursor(event.currentTarget)}
+                      onKeyDown={(event) => {
+                        if (event.nativeEvent.isComposing) return;
+                        if (codexMentionSuggestions.length) {
+                          if (event.key === "ArrowDown") {
+                            event.preventDefault();
+                            setCodexMentionIndex((value) => (value + 1) % codexMentionSuggestions.length);
+                            return;
+                          }
+                          if (event.key === "ArrowUp") {
+                            event.preventDefault();
+                            setCodexMentionIndex(
+                              (value) => (value - 1 + codexMentionSuggestions.length) % codexMentionSuggestions.length,
+                            );
+                            return;
+                          }
+                          if (
+                            event.key === "Tab" ||
+                            (event.key === "Enter" &&
+                              !event.shiftKey &&
+                              !event.altKey &&
+                              !event.metaKey &&
+                              !event.ctrlKey)
+                          ) {
+                            event.preventDefault();
+                            handleInsertCodexMention();
+                            return;
+                          }
+                        }
+                        if (
+                          event.key === "Enter" &&
                           !event.shiftKey &&
                           !event.altKey &&
                           !event.metaKey &&
@@ -6422,6 +6599,8 @@ export function App() {
                           event.preventDefault();
                           if (canSubmitCodexPrompt) {
                             void runSafely(handleRunCodex);
+                          } else if (project && environment?.canRunCodex === false) {
+                            openEnvironmentSettings("缺少 Codex CLI。请在设置中查看本地环境并重新检测。");
                           }
                           return;
                         }
@@ -6429,6 +6608,8 @@ export function App() {
                           event.preventDefault();
                           if (canSubmitCodexPrompt) {
                             void runSafely(handleAskCodex);
+                          } else if (project && environment?.canRunCodex === false) {
+                            openEnvironmentSettings("缺少 Codex CLI。请在设置中查看本地环境并重新检测。");
                           }
                           return;
                         }
@@ -6436,6 +6617,8 @@ export function App() {
                           event.preventDefault();
                           if (canSubmitCodexPrompt) {
                             void runSafely(handleRunCodex);
+                          } else if (project && environment?.canRunCodex === false) {
+                            openEnvironmentSettings("缺少 Codex CLI。请在设置中查看本地环境并重新检测。");
                           }
                           return;
                         }
@@ -6443,44 +6626,21 @@ export function App() {
                           event.currentTarget.blur();
                         }
                       }}
-                      placeholder="让 Codex 修改..."
+                      placeholder={
+                        environment?.canRunCodex === false
+                          ? "Codex CLI 不可用，可先写下请求并在设置中重新检测"
+                          : "让 Codex 修改..."
+                      }
                       title={`Codex 命令条 (${shortcuts.codex} 聚焦，Enter 修改，⌥Enter 提问，Shift+Enter 换行；可用 @文件名 引用项目文件，#label/#citation 引用符号)`}
-	                      disabled={!project || environment?.canRunCodex === false}
-	                    />
-	                    {codexMentionSuggestions.length > 0 && (
-	                      <div className="codex-mention-menu" role="listbox" aria-label="Codex 上下文引用建议">
-	                        <div className="codex-mention-menu-title">
-	                          {codexMentionQuery?.trigger === "@" ? "项目文件" : "标签 / 引用"}
-	                        </div>
-	                        {codexMentionSuggestions.map((suggestion, index) => (
-	                          <button
-	                            type="button"
-	                            key={`${suggestion.kind}:${suggestion.value}`}
-	                            className={[
-	                              "codex-mention-item",
-	                              index === codexMentionIndex ? "codex-mention-item-active" : "",
-	                            ]
-	                              .filter(Boolean)
-	                              .join(" ")}
-	                            onMouseDown={(event) => {
-	                              event.preventDefault();
-	                              handleInsertCodexMention(suggestion);
-	                            }}
-	                            role="option"
-	                            aria-selected={index === codexMentionIndex}
-	                          >
-	                            <span className={`codex-mention-kind codex-mention-kind-${suggestion.kind}`}>
-	                              {codexMentionKindLabel(suggestion.kind)}
-	                            </span>
-	                            <span className="codex-mention-copy">
-	                              <strong>{suggestion.title}</strong>
-	                              <small>{suggestion.detail}</small>
-	                            </span>
-	                          </button>
-	                        ))}
-	                      </div>
-	                    )}
-	                    <div className="codex-command-key-hint">
+                      disabled={!project}
+                    />
+                    <CodexMentionMenu
+                      trigger={codexMentionQuery?.trigger}
+                      suggestions={codexMentionSuggestions}
+                      activeIndex={codexMentionIndex}
+                      onSelect={handleInsertCodexMention}
+                    />
+                    <div className="codex-command-key-hint">
                       Enter 修改 · ⌥Enter 提问 · Shift+Enter 换行
                     </div>
                   </div>
@@ -6525,6 +6685,20 @@ export function App() {
                       aria-label="撤回本次 Codex 修改"
                     >
                       <Undo2 size={16} />
+                    </button>
+                  )}
+                  {!isCodexRunning && project && environment?.canRunCodex === false && (
+                    <button
+                      type="button"
+                      className="codex-command-config"
+                      onClick={() =>
+                        openEnvironmentSettings("缺少 Codex CLI。请在设置中查看本地环境并重新检测。")
+                      }
+                      title="配置 Codex CLI"
+                      aria-label="配置 Codex CLI"
+                    >
+                      <Settings size={15} />
+                      <span>配置</span>
                     </button>
                   )}
                   {isCodexRunning ? (
@@ -7451,17 +7625,27 @@ export function App() {
                 <button
                   type="button"
                   onClick={() => void runSafely(handleCompile)}
-                  disabled={!project || isCompiling || !environment?.canCompile}
-                  title={dirtyTabCount ? `编译前会保存 ${dirtyTabCount} 个已修改文件 (⌘Enter)` : "编译 (⌘Enter)"}
+                  disabled={!project || isCompiling}
+                  title={
+                    environment?.canCompile === false
+                      ? "配置 LaTeX 编译环境"
+                      : dirtyTabCount
+                        ? `编译前会保存 ${dirtyTabCount} 个已修改文件 (⌘Enter)`
+                        : "编译 (⌘Enter)"
+                  }
                 >
                   <Play size={16} />
-                  <span>{isCompiling ? "编译中" : "编译"}</span>
+                  <span>{environment?.canCompile === false ? "配置" : isCompiling ? "编译中" : "编译"}</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => void runSafely(handleCompileFromScratch)}
-                  disabled={!project || isCompiling || !environment?.canCompile}
-                  title="清理辅助文件并从零重新编译"
+                  disabled={!project || isCompiling}
+                  title={
+                    environment?.canCompile === false
+                      ? "配置 LaTeX 编译环境"
+                      : "清理辅助文件并从零重新编译"
+                  }
                   aria-label="从零重新编译"
                 >
                   <RefreshCcw size={16} />
@@ -7671,18 +7855,22 @@ export function App() {
                       <button
                         type="button"
                         onClick={() => void runSafely(handleCompile)}
-                        disabled={!project || isCompiling || !environment?.canCompile}
-                        title="编译"
+                        disabled={!project || isCompiling}
+                        title={environment?.canCompile === false ? "配置 LaTeX 编译环境" : "编译"}
                       >
                         <Play size={16} />
-                        <span>{isCompiling ? "编译中" : "编译"}</span>
+                        <span>{environment?.canCompile === false ? "配置" : isCompiling ? "编译中" : "编译"}</span>
                       </button>
                       <button
                         type="button"
                         className="icon-button"
                         onClick={() => void runSafely(handleCompileFromScratch)}
-                        disabled={!project || isCompiling || !environment?.canCompile}
-                        title="清理辅助文件并从零重新编译"
+                        disabled={!project || isCompiling}
+                        title={
+                          environment?.canCompile === false
+                            ? "配置 LaTeX 编译环境"
+                            : "清理辅助文件并从零重新编译"
+                        }
                         aria-label="从零重新编译"
                       >
                         <RefreshCcw size={16} />
@@ -7795,273 +7983,6 @@ function AssetPreviewLoadingState() {
   return (
     <div className="empty-preview">
       <strong>正在加载资源预览</strong>
-    </div>
-  );
-}
-
-function CompileErrorPanel({
-  result,
-  canRunCodex,
-  onDiagnosticClick,
-  onCopyDiagnostic,
-  onCopyDiagnosticCommand,
-  onCopyCompileLog,
-  onFixDiagnosticWithCodex,
-  onExplainDiagnosticWithCodex,
-  onFixWithCodex,
-  onExplainWithCodex,
-}: {
-  result: CompileResult;
-  canRunCodex: boolean;
-  onDiagnosticClick: (diagnostic: Diagnostic) => void;
-  onCopyDiagnostic: (diagnostic: Diagnostic) => void;
-  onCopyDiagnosticCommand: (diagnostic: Diagnostic) => void;
-  onCopyCompileLog: () => void;
-  onFixDiagnosticWithCodex: (diagnostic: Diagnostic) => void;
-  onExplainDiagnosticWithCodex: (diagnostic: Diagnostic) => void;
-  onFixWithCodex: () => void;
-  onExplainWithCodex: () => void;
-}) {
-  const errors = result.diagnostics.filter((diagnostic) => diagnostic.severity === "error");
-  const warnings = result.diagnostics.filter((diagnostic) => diagnostic.severity === "warning");
-  const visibleDiagnostics = errors.length ? errors : result.diagnostics;
-  const [activeDiagnosticIndex, setActiveDiagnosticIndex] = useState(0);
-  const activeDiagnostic = visibleDiagnostics[activeDiagnosticIndex] ?? visibleDiagnostics[0];
-  const activeInstallCommand = activeDiagnostic ? diagnosticInstallCommand(activeDiagnostic) : "";
-
-  useEffect(() => {
-    setActiveDiagnosticIndex(0);
-  }, [result]);
-
-  function jumpToDiagnostic(index: number) {
-    if (!visibleDiagnostics.length) return;
-    const nextIndex = (index + visibleDiagnostics.length) % visibleDiagnostics.length;
-    setActiveDiagnosticIndex(nextIndex);
-    onDiagnosticClick(visibleDiagnostics[nextIndex]);
-  }
-
-  return (
-    <div className="compile-error-panel">
-      <div className="compile-error-heading">
-        <AlertTriangle size={20} />
-        <div>
-          <strong>编译失败</strong>
-          <span>点击错误可跳转到对应源码位置。</span>
-        </div>
-        <div className="compile-heading-actions">
-          <button
-            type="button"
-            className="compile-codex-explain-button"
-            onClick={onExplainWithCodex}
-            disabled={!canRunCodex}
-            title={canRunCodex ? "让 Codex 解释这次编译失败，不修改文件" : "Codex 当前不可用"}
-          >
-            <Search size={15} />
-            <span>Codex 解释</span>
-          </button>
-          <button
-            type="button"
-            className={`compile-codex-fix-button ${errors.length ? "compile-ai-fix-primary" : ""}`}
-            onClick={onFixWithCodex}
-            disabled={!canRunCodex}
-            title={canRunCodex ? "让 Codex 根据错误日志修复项目" : "Codex 当前不可用"}
-          >
-            <Bot size={15} />
-            <span>{errors.length ? "自动 AI 纠错" : "Codex 修复"}</span>
-          </button>
-        </div>
-      </div>
-      <div className="compile-diagnostic-nav" aria-label="编译诊断导航">
-        <button
-          type="button"
-          onClick={() => jumpToDiagnostic(activeDiagnosticIndex - 1)}
-          disabled={!visibleDiagnostics.length}
-          title="上一条诊断"
-        >
-          <ChevronLeft size={14} />
-          <span>上一条</span>
-        </button>
-        <span>
-          {visibleDiagnostics.length ? `${activeDiagnosticIndex + 1}/${visibleDiagnostics.length}` : "0"}
-        </span>
-        <button
-          type="button"
-          onClick={() => jumpToDiagnostic(activeDiagnosticIndex + 1)}
-          disabled={!visibleDiagnostics.length}
-          title="下一条诊断"
-        >
-          <span>下一条</span>
-          <ChevronRight size={14} />
-        </button>
-        <button
-          type="button"
-          className="compile-diagnostic-fix-button"
-          onClick={() => activeDiagnostic && onFixDiagnosticWithCodex(activeDiagnostic)}
-          disabled={!canRunCodex || !activeDiagnostic}
-          title={canRunCodex ? "让 Codex 只修复当前这条诊断" : "Codex 当前不可用"}
-        >
-          <Bot size={14} />
-          <span>修当前</span>
-        </button>
-        <button
-          type="button"
-          className="compile-diagnostic-explain-button"
-          onClick={() => activeDiagnostic && onExplainDiagnosticWithCodex(activeDiagnostic)}
-          disabled={!canRunCodex || !activeDiagnostic}
-          title={canRunCodex ? "让 Codex 解释当前这条诊断，不修改文件" : "Codex 当前不可用"}
-        >
-          <Search size={14} />
-          <span>解释</span>
-        </button>
-        <button
-          type="button"
-          onClick={() => jumpToDiagnostic(activeDiagnosticIndex)}
-          disabled={!activeDiagnostic?.file}
-          title={activeDiagnostic?.file ? "跳转到当前诊断源码位置" : "当前诊断没有源码位置"}
-        >
-          <LocateFixed size={14} />
-          <span>定位</span>
-        </button>
-      </div>
-      {activeDiagnostic && (
-        <div className="compile-active-diagnostic">
-          <div className="compile-active-diagnostic-top">
-            <span className={`compile-active-severity diagnostic-${activeDiagnostic.severity}`}>
-              {diagnosticSeverityLabel(activeDiagnostic.severity)}
-            </span>
-            <strong>{formatDiagnosticLocation(activeDiagnostic) || "全局日志"}</strong>
-            <div className="compile-active-actions">
-              <button
-                type="button"
-                onClick={() => onCopyDiagnostic(activeDiagnostic)}
-                title="复制当前诊断和修复建议"
-              >
-                <Clipboard size={14} />
-                <span>复制</span>
-              </button>
-              {activeInstallCommand && (
-                <button
-                  type="button"
-                  className="compile-active-command-button"
-                  onClick={() => onCopyDiagnosticCommand(activeDiagnostic)}
-                  title={activeInstallCommand}
-                >
-                  <Clipboard size={14} />
-                  <span>复制安装命令</span>
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={() => onDiagnosticClick(activeDiagnostic)}
-                disabled={!activeDiagnostic.file}
-                title={activeDiagnostic.file ? "跳转到源码位置" : "当前诊断没有源码位置"}
-              >
-                <LocateFixed size={14} />
-                <span>定位</span>
-              </button>
-              <button
-                type="button"
-                className="compile-active-codex-button"
-                onClick={() => onFixDiagnosticWithCodex(activeDiagnostic)}
-                disabled={!canRunCodex}
-                title={canRunCodex ? "让 Codex 修复当前错误" : "Codex 当前不可用"}
-              >
-                <Bot size={14} />
-                <span>Codex 修当前</span>
-              </button>
-              <button
-                type="button"
-                className="compile-active-explain-button"
-                onClick={() => onExplainDiagnosticWithCodex(activeDiagnostic)}
-                disabled={!canRunCodex}
-                title={canRunCodex ? "让 Codex 解释当前错误" : "Codex 当前不可用"}
-              >
-                <Search size={14} />
-                <span>解释</span>
-              </button>
-            </div>
-          </div>
-          <p>{activeDiagnostic.message}</p>
-          {activeDiagnostic.hint && (
-            <div className="compile-active-hint">
-              <AlertTriangle size={14} />
-              <div>
-                <strong>建议处理方式</strong>
-                <span>{activeDiagnostic.hint}</span>
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-      <div className="diagnostics-list">
-        {visibleDiagnostics.length ? (
-          visibleDiagnostics.map((diagnostic, index) => (
-            <button
-              key={`${diagnostic.file ?? "global"}-${diagnostic.line ?? index}-${index}`}
-              type="button"
-              className={[
-                "diagnostic",
-                `diagnostic-${diagnostic.severity}`,
-                index === activeDiagnosticIndex ? "diagnostic-active" : "",
-              ]
-                .filter(Boolean)
-                .join(" ")}
-              onClick={() => {
-                setActiveDiagnosticIndex(index);
-                onDiagnosticClick(diagnostic);
-              }}
-            >
-              <span>{diagnosticSeverityLabel(diagnostic.severity)}</span>
-              <span>{formatDiagnosticLocation(diagnostic)}</span>
-              <span className="diagnostic-copy">
-                <span>{diagnostic.message}</span>
-                {diagnostic.hint && <small>{diagnostic.hint}</small>}
-              </span>
-            </button>
-          ))
-        ) : (
-          <div className="empty-log">没有解析到具体行号，请查看原始日志。</div>
-        )}
-      </div>
-      {warnings.length > 0 && errors.length > 0 && (
-        <details className="compile-warning-details">
-          <summary>{warnings.length} 条附带警告</summary>
-          {warnings.map((diagnostic, index) => (
-            <button
-              key={`${diagnostic.message}-${index}`}
-              type="button"
-              className="diagnostic diagnostic-warning"
-              onClick={() => onDiagnosticClick(diagnostic)}
-            >
-              <span>警告</span>
-              <span>{formatDiagnosticLocation(diagnostic)}</span>
-              <span className="diagnostic-copy">
-                <span>{diagnostic.message}</span>
-                {diagnostic.hint && <small>{diagnostic.hint}</small>}
-              </span>
-            </button>
-          ))}
-        </details>
-      )}
-      <details className="compile-log-details">
-        <summary>
-          <span>原始日志</span>
-          <button
-            type="button"
-            onClick={(event) => {
-              event.preventDefault();
-              event.stopPropagation();
-              onCopyCompileLog();
-            }}
-            title="复制原始编译日志"
-            aria-label="复制原始编译日志"
-          >
-            <Clipboard size={14} />
-            <span>复制日志</span>
-          </button>
-        </summary>
-        <pre>{tailLog(result.log)}</pre>
-      </details>
     </div>
   );
 }
@@ -9907,27 +9828,6 @@ function updateStableHash(seed: number, value: string) {
   return hash >>> 0;
 }
 
-function formatDiagnosticLocation(diagnostic: Diagnostic) {
-  if (!diagnostic.file) return "";
-  return `${diagnostic.file}${diagnostic.line ? `:${diagnostic.line}` : ""}`;
-}
-
-function formatDiagnosticText(diagnostic: Diagnostic) {
-  return diagnostic.hint ? `${diagnostic.message} Hint: ${diagnostic.hint}` : diagnostic.message;
-}
-
-function diagnosticInstallCommand(diagnostic: Diagnostic) {
-  if (!diagnostic.hint) return "";
-  const match = diagnostic.hint.match(/`(sudo\s+tlmgr\s+install\s+[^`]+)`/);
-  return match?.[1]?.trim() ?? "";
-}
-
-function diagnosticSeverityLabel(severity: Diagnostic["severity"]) {
-  if (severity === "error") return "错误";
-  if (severity === "warning") return "警告";
-  return "信息";
-}
-
 function diagnosticsForPath(result: CompileResult | null, path: string, projectRoot?: string) {
   if (!result || result.success || !path) return [];
   return result.diagnostics.filter((diagnostic) => {
@@ -10322,11 +10222,6 @@ function codexMentionSort(left: string, right: string, query: string) {
   return leftStarts - rightStarts || left.length - right.length || left.localeCompare(right);
 }
 
-function codexMentionKindLabel(kind: CodexMentionSuggestion["kind"]) {
-  if (kind === "file") return "@";
-  return kind === "citation" ? "cite" : "label";
-}
-
 function uniqueProjectSymbolByKey(symbols: ProjectSymbol[], key: string) {
   const matches = symbols.filter((symbol) => symbol.key.toLowerCase() === key.toLowerCase());
   return matches.length === 1 ? matches[0] : null;
@@ -10569,10 +10464,6 @@ function remapActivePathAfterRename(activePath: string, fromPath: string, toPath
 
 function isProjectMainPathAffected(mainFile: string, targetPath: string) {
   return mainFile === targetPath || mainFile.startsWith(`${targetPath}/`);
-}
-
-function tailLog(log: string) {
-  return log.split("\n").slice(-80).join("\n").trim() || "没有日志输出。";
 }
 
 function clamp(value: number, min: number, max: number) {

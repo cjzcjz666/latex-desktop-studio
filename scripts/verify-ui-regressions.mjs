@@ -16,18 +16,27 @@ const macInfoPlist = readFileSync(new URL("../src-tauri/Info.plist", import.meta
 const tauri = readFileSync(new URL("../src/tauri.ts", import.meta.url), "utf8");
 const pdfPreview = readFileSync(new URL("../src/components/PdfPreview.tsx", import.meta.url), "utf8");
 const fileTreeNode = readFileSync(new URL("../src/components/FileTreeNode.tsx", import.meta.url), "utf8");
+const toolPill = readFileSync(new URL("../src/components/ToolPill.tsx", import.meta.url), "utf8");
 const codexAnswerView = readFileSync(new URL("../src/components/CodexAnswerView.tsx", import.meta.url), "utf8");
 const codexContextStrip = readFileSync(new URL("../src/components/CodexContextStrip.tsx", import.meta.url), "utf8");
 const codexDiffView = readFileSync(new URL("../src/components/CodexDiffView.tsx", import.meta.url), "utf8");
 const codexHistoryList = readFileSync(new URL("../src/components/CodexHistoryList.tsx", import.meta.url), "utf8");
+const codexMentionMenu = readFileSync(new URL("../src/components/CodexMentionMenu.tsx", import.meta.url), "utf8");
 const codexProgressView = readFileSync(new URL("../src/components/CodexProgressView.tsx", import.meta.url), "utf8");
+const compileErrorPanel = readFileSync(new URL("../src/components/CompileErrorPanel.tsx", import.meta.url), "utf8");
+const diagnostics = readFileSync(new URL("../src/lib/diagnostics.ts", import.meta.url), "utf8");
+const safetyConfirmDialog = readFileSync(new URL("../src/components/SafetyConfirmDialog.tsx", import.meta.url), "utf8");
 const appAndPreferences = `${app}\n${preferences}`;
+const appAndToolPill = `${app}\n${toolPill}`;
 const appAndCodexAnswer = `${app}\n${codexAnswerView}`;
 const appAndCodexContextStrip = `${app}\n${codexContextStrip}\n${codexContext}`;
 const appAndCodexDiff = `${app}\n${codexDiffView}`;
 const appAndCodexHistory = `${app}\n${codexHistoryList}\n${codexDiffView}`;
+const appAndCodexMentionMenu = `${app}\n${codexMentionMenu}`;
 const appAndCodexProgress = `${app}\n${codexProgressView}`;
 const appAndCodexContext = `${app}\n${codexContext}`;
+const appAndCompileErrorPanel = `${app}\n${compileErrorPanel}\n${diagnostics}`;
+const appAndSafetyConfirmDialog = `${app}\n${safetyConfirmDialog}`;
 const appCodexDiffAndContext = `${appAndCodexDiff}\n${codexContext}`;
 
 const checks = [];
@@ -150,7 +159,7 @@ addCheck(
     ".codex-command-key-hint,",
     ".project-actions-minimal button:not(.topbar-compile-button) span",
     ".codex-command-center-sidebar .codex-command-bar textarea",
-  ]) && app.includes('placeholder="让 Codex 修改..."'),
+  ]) && app.includes(': "让 Codex 修改..."'),
 );
 
 addCheck(
@@ -419,7 +428,7 @@ addCheck(
 
 addCheck(
   "compile errors render in the preview area with clickable diagnostics and Codex fix",
-  includesAll(app, [
+  includesAll(appAndCompileErrorPanel, [
     "compileResult && !compileResult.success",
     "<CompileErrorPanel",
     "onDiagnosticClick",
@@ -467,6 +476,30 @@ addCheck(
       "color: #315e68;",
     ]) &&
     hasCssBlock(".compile-active-explain-button", ["background: #f7fbfc;", "color: #315e68;"]),
+);
+
+addCheck(
+  "compile error panel lives outside the main App component",
+  includesAll(app, [
+    'import { CompileErrorPanel } from "./components/CompileErrorPanel"',
+    "<CompileErrorPanel",
+  ]) &&
+    includesAll(compileErrorPanel, [
+      "export function CompileErrorPanel",
+      "CompileErrorPanelProps",
+      "activeDiagnosticIndex",
+      "jumpToDiagnostic",
+      "compile-error-panel",
+      "自动 AI 纠错",
+    ]) &&
+    includesAll(diagnostics, [
+      "export function formatDiagnosticLocation",
+      "export function formatDiagnosticText",
+      "export function diagnosticInstallCommand",
+      "export function diagnosticSeverityLabel",
+      "export function tailLog",
+    ]) &&
+    !app.includes("function CompileErrorPanel"),
 );
 
 addCheck(
@@ -528,7 +561,7 @@ addCheck(
 
 addCheck(
   "compile error panel highlights the active diagnostic with copyable remediation hints",
-  includesAll(app, [
+  includesAll(appAndCompileErrorPanel, [
     "handleCopyDiagnostic",
     "handleCopyCompileLog",
     "onCopyDiagnostic",
@@ -687,6 +720,42 @@ addCheck(
 );
 
 addCheck(
+  "unsaved project switches and app close use an app-native confirmation dialog",
+  includesAll(appAndSafetyConfirmDialog, [
+    'import { SafetyConfirmDialog',
+    "type PendingSafetyConfirm",
+    "<SafetyConfirmDialog",
+    "requestDiscardUnsavedTabs",
+    "setPendingSafetyConfirm",
+    "handleConfirmSafetyDialog",
+    "handleCancelSafetyDialog",
+    "onDiscardAndConfirm",
+    "onSaveAndConfirm",
+    'saveOpenTabsWithHistory("手动保存")',
+    'kind: "discard-unsaved"',
+    'kind: "close-app"',
+    "onCloseRequested",
+    "getCurrentWindow().destroy()",
+    "handleCreateProject",
+    "handleOpenProject",
+    "handleChooseProjectFolder",
+    "handleImportProjectZip",
+    "handleOpenRecentProject",
+    "export function SafetyConfirmDialog",
+    "SafetyConfirmDialogRequest",
+    "safety-confirm-overlay",
+    "丢弃并${request.action}",
+    "保存并${request.action}",
+    "保存并关闭",
+  ]) &&
+    !app.includes("window.confirm(") &&
+    hasCssBlock(".safety-confirm-overlay", ["position: fixed;", "z-index: 42;"]) &&
+    hasCssBlock(".safety-confirm-dialog", ["background: #ffffff;", "border: 1px solid #d7b26a;"]) &&
+    hasCssBlock(".safety-confirm-discard", ["background: #fff5f3;", "color: #8f3428;"]) &&
+    hasCssBlock(".safety-confirm-primary", ["background: #fef0d4;", "color: #68460b;"]),
+);
+
+addCheck(
   "project settings can rename the displayed project name without moving the folder",
   includesAll(app, [
     "displayName",
@@ -768,6 +837,54 @@ addCheck(
       "-enable-write18",
       "附加编译参数",
     ]),
+);
+
+addCheck(
+  "settings expose local LaTeX and Codex environment health",
+  includesAll(appAndToolPill, [
+    'import { ToolPill } from "./components/ToolPill"',
+    "isEnvironmentChecking",
+    "environmentTools",
+    "missingEnvironmentTools",
+    "handleRefreshEnvironment",
+    "checkEnvironment()",
+    "setEnvironment(nextEnvironment)",
+    "本地环境",
+    "重新检测",
+    "安装提示",
+    "<ToolPill tool={tool} key={tool.name} />",
+    "LaTeX 编译和 Codex 均可用。",
+    "缺少工具时，编辑仍可继续",
+    "本地 LaTeX 编译和 Codex 环境均可用。",
+    "export function ToolPill",
+    "tool.found ? \"tool-found\" : \"tool-missing\"",
+  ]) &&
+    hasCssBlock(".settings-environment", ["border-top: 1px solid #e4e9ef;", "display: grid;"]) &&
+    hasCssBlock(".settings-tool-grid", ["grid-template-columns: repeat(auto-fit, minmax(118px, 1fr));"]) &&
+    hasCssBlock(".tool-pill", ["grid-template-columns: auto minmax(0, 1fr) auto;"]) &&
+    hasCssBlock(".tool-found", ["background: #eef8f2;", "color: #217044;"]) &&
+    hasCssBlock(".tool-missing", ["background: #fff5f3;", "color: #8f3428;"]) &&
+    hasCssBlock(".settings-environment-hints", ["background: #fff8eb;", "border: 1px solid #ead2a0;"]),
+);
+
+addCheck(
+  "missing LaTeX or Codex tools guide users to settings instead of dead disabled controls",
+  includesAll(app, [
+    "openEnvironmentSettings(message: string)",
+    "缺少 LaTeX 编译环境。请在设置中查看本地环境并重新检测。",
+    "缺少 Codex CLI。请在设置中查看本地环境并重新检测。",
+    "topbar-compile-button-setup",
+    "配置 LaTeX 编译环境",
+    "Codex CLI 不可用，可先写下请求并在设置中重新检测",
+    "codex-command-config",
+    "配置 Codex CLI",
+    "disabled={!project || isCompiling}",
+    "disabled={!project}",
+    "openEnvironmentSettings(\"缺少 Codex CLI",
+  ]) &&
+    !app.includes("disabled={!project || isCompiling || !environment?.canCompile}") &&
+    hasCssBlock(".topbar-compile-button-setup", ["background: #fff8eb;", "color: #68460b;"]) &&
+    hasCssBlock(".codex-command-config", ["background: #fff8eb;", "color: #765415;"]),
 );
 
 addCheck(
@@ -1006,7 +1123,7 @@ addCheck(
 
 addCheck(
   "missing-package diagnostics expose a copyable tlmgr install command",
-  includesAll(app, [
+  includesAll(appAndCompileErrorPanel, [
     "handleCopyDiagnosticCommand",
     "diagnosticInstallCommand",
     "sudo\\s+tlmgr\\s+install",
@@ -1782,7 +1899,7 @@ addCheck(
 
 addCheck(
   "Codex command input suggests @files and #symbols inline",
-  includesAll(app, [
+  includesAll(appAndCodexMentionMenu, [
     "CodexMentionQuery",
     "CodexMentionSuggestion",
     "MAX_CODEX_MENTION_SUGGESTIONS",
@@ -1807,6 +1924,22 @@ addCheck(
     hasCssBlock(".codex-mention-item", ["grid-template-columns: auto minmax(0, 1fr);"]) &&
     hasCssBlock(".codex-mention-item:hover,\n.codex-mention-item-active", ["background: #eef7fb;"]) &&
     hasCssBlock(".codex-mention-kind-citation", ["background: #fff4df;"]),
+);
+
+addCheck(
+  "Codex mention menu lives outside the main App component",
+  includesAll(app, [
+    'import { CodexMentionMenu',
+    "<CodexMentionMenu",
+  ]) &&
+    includesAll(codexMentionMenu, [
+      "export function CodexMentionMenu",
+      "export type CodexMentionSuggestion",
+      "codex-mention-menu",
+      "Codex 上下文引用建议",
+      "codexMentionKindLabel",
+    ]) &&
+    !app.includes('className="codex-mention-menu"'),
 );
 
 addCheck(
@@ -2884,13 +3017,13 @@ addCheck(
     "RefreshCcw",
     "handleCompileFromScratch",
     "正在清理构建缓存并从零编译",
-    "await saveAllOpenTabs()",
+    "await saveOpenTabsWithHistory(\"编译前保存\")",
     "await cleanProjectBuild(project.root)",
     "setCompileResult(null)",
     "setPdfRevision((value) => value + 1)",
     "await compileActiveProject(\"manual\")",
     'aria-label="从零重新编译"',
-    'title="清理辅助文件并从零重新编译"',
+    "清理辅助文件并从零重新编译",
   ]),
 );
 
