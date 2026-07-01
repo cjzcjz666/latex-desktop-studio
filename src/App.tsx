@@ -61,7 +61,11 @@ import {
 } from "react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { CodexAnswerView } from "./components/CodexAnswerView";
+import { CodexContextStrip } from "./components/CodexContextStrip";
 import { CodexDiffView } from "./components/CodexDiffView";
+import { CodexHistoryList } from "./components/CodexHistoryList";
+import { CodexProgressView } from "./components/CodexProgressView";
 import { FileTreeNode } from "./components/FileTreeNode";
 import {
   codexContextKindLabel,
@@ -96,6 +100,21 @@ import {
   MONACO_LATEX_THEME,
   type MonacoApi,
 } from "./lib/monacoLatex";
+import {
+  DEFAULT_SHORTCUTS,
+  loadBooleanPreference,
+  loadNumberPreference,
+  loadShortcutPreferences,
+  loadViewModePreference,
+  normalizeShortcutMap,
+  saveBooleanPreference,
+  saveNumberPreference,
+  saveShortcutPreferences,
+  saveViewModePreference,
+  SHORTCUT_DEFINITIONS,
+  type ShortcutMap,
+  type ViewMode,
+} from "./lib/preferences";
 import {
   cancelCodexRun,
   cancelCompile,
@@ -194,7 +213,6 @@ const textExtensions = new Set([
   "log",
 ]);
 
-type ViewMode = "editor" | "split" | "preview";
 type ProjectTemplate = "article" | "preprint" | "chinese" | "chinese-multifile" | "multifile" | "beamer" | "blank";
 
 const PROJECT_TEMPLATES: Array<{
@@ -460,24 +478,6 @@ type CodexMentionSuggestion = {
 
 type AutoSaveState = "idle" | "saving" | "saved" | "error";
 type CodexRunMode = "edit" | "ask";
-type ShortcutActionId =
-  | "save"
-  | "compile"
-  | "codex"
-  | "codexContext"
-  | "togglePreview"
-  | "quickOpen"
-  | "projectSearch"
-  | "findInFile"
-  | "replaceInFile"
-  | "goToLine"
-  | "toggleComment"
-  | "reviewMode"
-  | "insertReviewComment"
-  | "syncPdf"
-  | "exportPdf"
-  | "cleanBuild";
-type ShortcutMap = Record<ShortcutActionId, string>;
 
 const RESIZE_HANDLE_WIDTH = 12;
 const MIN_EDITOR_WIDTH = 320;
@@ -548,47 +548,6 @@ const SYMBOLS_COLLAPSED_PREF_KEY = "latex-studio:symbols-collapsed";
 const TODOS_COLLAPSED_PREF_KEY = "latex-studio:todos-collapsed";
 const PROJECT_EDITOR_SESSION_PREF_PREFIX = "latex-studio:project-session";
 const PROJECT_SAVE_HISTORY_SIGNATURE_PREF_PREFIX = "latex-studio:save-history-signature";
-const SHORTCUT_PREF_KEY = "latex-studio:shortcuts";
-const DEFAULT_SHORTCUTS: ShortcutMap = {
-  save: "⌘S",
-  compile: "⌘↵",
-  codex: "⌘K",
-  codexContext: "⌘⇧K",
-  togglePreview: "⌘P",
-  quickOpen: "⌘O",
-  projectSearch: "⌘⇧F",
-  findInFile: "⌘F",
-  replaceInFile: "⌘⌥F",
-  goToLine: "⌘G",
-  toggleComment: "⌘/",
-  reviewMode: "⌘⇧M",
-  insertReviewComment: "⌘⇧A",
-  syncPdf: "⌘⌥P",
-  exportPdf: "⌘⇧E",
-  cleanBuild: "⌘⇧↵",
-};
-const SHORTCUT_DEFINITIONS: Array<{
-  id: ShortcutActionId;
-  label: string;
-  hint: string;
-}> = [
-  { id: "compile", label: "编译", hint: "保存脏文件并编译当前项目" },
-  { id: "codex", label: "AI 修改", hint: "聚焦底部 Codex 命令条" },
-  { id: "codexContext", label: "锁定上下文", hint: "把当前选区或光标附近内容交给 Codex" },
-  { id: "togglePreview", label: "切换预览", hint: "在分屏和纯预览之间切换" },
-  { id: "save", label: "保存", hint: "保存当前打开的修改" },
-  { id: "quickOpen", label: "快速打开", hint: "按文件名跳转" },
-  { id: "projectSearch", label: "项目搜索", hint: "搜索整个 LaTeX 项目" },
-  { id: "findInFile", label: "当前文件查找", hint: "打开 Monaco 查找" },
-  { id: "replaceInFile", label: "当前文件替换", hint: "打开 Monaco 替换" },
-  { id: "goToLine", label: "跳转行号", hint: "跳到当前文件行号" },
-  { id: "toggleComment", label: "行注释", hint: "注释或取消注释选中行" },
-  { id: "reviewMode", label: "Review 批注", hint: "进入/退出批注模式，并高亮 REVIEW 内容" },
-  { id: "insertReviewComment", label: "添加批注", hint: "在 Review 模式下为当前行或选中内容添加批注" },
-  { id: "syncPdf", label: "定位 PDF", hint: "从当前源码光标跳到 PDF 对应位置" },
-  { id: "exportPdf", label: "导出 PDF", hint: "导出最近一次编译的 PDF" },
-  { id: "cleanBuild", label: "清理编译", hint: "清理构建缓存" },
-];
 export function App() {
   const [environment, setEnvironment] = useState<EnvironmentStatus | null>(null);
   const [projectPath, setProjectPath] = useState("");
@@ -2071,13 +2030,6 @@ export function App() {
   const codexContextTitleHint = pinnedCodexContext
     ? `已锁定 · ${formatCodexContextHint(pinnedCodexContext)}`
     : editorContextHint;
-  const hasCodexVisibleContext = Boolean(
-    pinnedCodexContext ||
-      codexPromptReferencedFiles.length ||
-      codexPromptReferencedSymbols.length ||
-      (isCodexDiffContextEnabled && canUseCodexDiffContext) ||
-      (isCodexContextOnlyEnabled && canUseCodexContextScope),
-  );
   const codexPreflightItems = useMemo(() => {
     if (!project || !codexPrompt.trim()) return [];
     const items: Array<{ key: string; label: string; detail: string; tone?: "scope" | "safe" | "warn" }> = [
@@ -6360,41 +6312,12 @@ export function App() {
                             />
                           </>
                         ) : codexAnswer ? (
-                          <div className="codex-answer">
-                            <div className="codex-answer-header">
-                              <div className="codex-answer-title">Codex 输出</div>
-                              <div className="codex-answer-actions">
-                                <button
-                                  type="button"
-                                  onClick={() => void runSafely(handleCopyCodexAnswer)}
-                                  title="复制 Codex 回答"
-                                  aria-label="复制 Codex 回答"
-                                >
-                                  <Clipboard size={13} />
-                                  <span>复制</span>
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={handleUseCodexAnswerAsEditPrompt}
-                                  title="把回答转成修改指令"
-                                  aria-label="把回答转成修改指令"
-                                >
-                                  <Pencil size={13} />
-                                  <span>转为修改</span>
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={handleInsertCodexAnswerAsReviewComment}
-                                  title="把回答插入为 REVIEW 批注"
-                                  aria-label="把回答插入为 REVIEW 批注"
-                                >
-                                  <MessageSquareText size={13} />
-                                  <span>转为批注</span>
-                                </button>
-                              </div>
-                            </div>
-                            <pre>{codexAnswer}</pre>
-                          </div>
+                          <CodexAnswerView
+                            answer={codexAnswer}
+                            onCopy={() => void runSafely(handleCopyCodexAnswer)}
+                            onUseAsEditPrompt={handleUseCodexAnswerAsEditPrompt}
+                            onInsertAsReviewComment={handleInsertCodexAnswerAsReviewComment}
+                          />
                         ) : codexEvents.length ? (
                           <CodexProgressView
                             events={codexEvents}
@@ -6407,40 +6330,11 @@ export function App() {
                             onRetry={() => void runSafely(handleRetryCodexRun)}
                           />
                         ) : codexHistory.length > 0 ? (
-                          <div className="codex-history">
-                            <div className="codex-history-title">历史修改</div>
-                            {codexHistory.slice(0, 4).map((item) => (
-                              <div className="codex-history-item" key={item.runId}>
-                                <button
-                                  type="button"
-                                  className="codex-history-main"
-                                  onClick={() => void runSafely(() => handleOpenCodexHistory(item))}
-                                  title={item.promptPreview ? `${item.promptPreview}\n${item.runId}` : `打开 ${item.runId}`}
-                                >
-                                  <span>{formatCodexHistoryTime(item.createdAt)}</span>
-                                  <strong>{item.changedFiles.length} 个文件</strong>
-                                  <small className="codex-history-prompt">{item.promptPreview || "未记录指令"}</small>
-                                  {item.finalMessage && (
-                                    <small className="codex-history-message">{item.finalMessage}</small>
-                                  )}
-                                  <small className="codex-history-files">
-                                    {item.changedFiles.slice(0, 2).join(", ") || item.runId}
-                                  </small>
-                                </button>
-                                <button
-                                  type="button"
-                                  className="codex-history-reuse"
-                                  onClick={handleReuseCodexHistoryPrompt.bind(null, item)}
-                                  disabled={!item.promptPreview}
-                                  title={item.promptPreview ? "复用这条 Codex 指令" : "这条历史没有可复用指令"}
-                                  aria-label="复用历史 Codex 指令"
-                                >
-                                  <Pencil size={13} />
-                                  <span>复用</span>
-                                </button>
-                              </div>
-                            ))}
-                          </div>
+                          <CodexHistoryList
+                            items={codexHistory}
+                            onOpen={(item) => void runSafely(() => handleOpenCodexHistory(item))}
+                            onReusePrompt={handleReuseCodexHistoryPrompt}
+                          />
                         ) : null}
                       </>
                     )}
@@ -6457,120 +6351,27 @@ export function App() {
                 >
                   <Bot size={16} />
                   <div className="codex-command-input-stack">
-                    {hasCodexVisibleContext && (
-                      <div className="codex-context-strip" aria-label="Codex 已选上下文">
-                        <span className="codex-context-strip-label">上下文</span>
-                        {pinnedCodexContext && (
-                          <span className="codex-context-chip codex-context-chip-pinned">
-                            <button
-                              type="button"
-                              className="codex-context-chip-main"
-                              onClick={() => void runSafely(() => openTextFile(pinnedCodexContext.file, { line: pinnedCodexContext.cursorLine }))}
-                              title={formatCodexContextHint(pinnedCodexContext)}
-                            >
-                              <LocateFixed size={12} />
-                              <span>{codexContextKindLabel(pinnedCodexContext)}</span>
-                              <small>{shortFileName(pinnedCodexContext.file)}:{pinnedCodexContext.cursorLine}</small>
-                            </button>
-                            <button
-                              type="button"
-                              className="codex-context-chip-remove"
-                              onClick={() => {
-                                setPinnedCodexContext(null);
-                                setStatus("已取消锁定 Codex 上下文。");
-                              }}
-                              title="清除锁定上下文"
-                              aria-label="清除锁定上下文"
-                            >
-                              <XCircle size={12} />
-                            </button>
-                          </span>
-                        )}
-                        {codexPromptReferencedFiles.map((path) => (
-                          <span className="codex-context-chip codex-context-chip-file" key={`file:${path}`}>
-                            <button
-                              type="button"
-                              className="codex-context-chip-main"
-                              onClick={() => void runSafely(() => handleOpenCodexContextFile(path))}
-                              title={`@${path}`}
-                            >
-                              <FileText size={12} />
-                              <span>@{shortFileName(path)}</span>
-                            </button>
-                            <button
-                              type="button"
-                              className="codex-context-chip-remove"
-                              onClick={() => handleRemoveCodexPromptMention("@", path)}
-                              title={`移除 @${path}`}
-                              aria-label={`移除 @${path}`}
-                            >
-                              <XCircle size={12} />
-                            </button>
-                          </span>
-                        ))}
-                        {codexPromptReferencedSymbols.map((symbol) => (
-                          <span
-                            className={`codex-context-chip codex-context-chip-${symbol.kind}`}
-                            key={`${symbol.kind}:${symbol.key}`}
-                          >
-                            <button
-                              type="button"
-                              className="codex-context-chip-main"
-                              onClick={() => void runSafely(() => handleOpenCodexContextSymbol(symbol))}
-                              title={`#${symbol.key} · ${symbol.file}:${symbol.line}`}
-                            >
-                              <Tags size={12} />
-                              <span>#{symbol.key}</span>
-                            </button>
-                            <button
-                              type="button"
-                              className="codex-context-chip-remove"
-                              onClick={() => handleRemoveCodexPromptMention("#", symbol.key)}
-                              title={`移除 #${symbol.key}`}
-                              aria-label={`移除 #${symbol.key}`}
-                            >
-                              <XCircle size={12} />
-                            </button>
-                          </span>
-                        ))}
-                        {isCodexDiffContextEnabled && canUseCodexDiffContext && (
-                          <span className="codex-context-chip codex-context-chip-diff">
-                            <span className="codex-context-chip-static">
-                              <Code2 size={12} />
-                              <span>当前 diff</span>
-                              <small>{diffSummary?.changedFiles.length ?? 0} 文件</small>
-                            </span>
-                          </span>
-                        )}
-                        {isCodexContextOnlyEnabled && canUseCodexContextScope && (
-                          <span className="codex-context-chip codex-context-chip-scope">
-                            <span className="codex-context-chip-static">
-                              <LocateFixed size={12} />
-                              <span>仅改上下文</span>
-                              <small>{codexEditableScopeFiles.length} 文件</small>
-                            </span>
-                          </span>
-                        )}
-                      </div>
-                    )}
-                    {shouldShowCodexPreflight && (
-                      <div className="codex-preflight-strip" aria-label="Codex 运行前预检">
-                        <span className="codex-preflight-label">预检</span>
-                        {codexPreflightItems.map((item) => (
-                          <span
-                            className={`codex-preflight-item ${
-                              item.tone ? `codex-preflight-item-${item.tone}` : ""
-                            }`}
-                            key={item.key}
-                            title={`${item.label}：${item.detail}`}
-                          >
-                            <strong>{item.label}</strong>
-                            <small>{item.detail}</small>
-                          </span>
-                        ))}
-                        <span className="codex-preflight-mode">执行会修改文件；问只读分析</span>
-                      </div>
-                    )}
+                    <CodexContextStrip
+                      pinnedContext={pinnedCodexContext}
+                      referencedFiles={codexPromptReferencedFiles}
+                      referencedSymbols={codexPromptReferencedSymbols}
+                      showDiffContext={isCodexDiffContextEnabled && canUseCodexDiffContext}
+                      diffFileCount={diffSummary?.changedFiles.length ?? 0}
+                      showContextScope={isCodexContextOnlyEnabled && canUseCodexContextScope}
+                      scopeFileCount={codexEditableScopeFiles.length}
+                      preflightItems={codexPreflightItems}
+                      showPreflight={shouldShowCodexPreflight}
+                      onOpenPinnedContext={(context) =>
+                        void runSafely(() => openTextFile(context.file, { line: context.cursorLine }))
+                      }
+                      onClearPinnedContext={() => {
+                        setPinnedCodexContext(null);
+                        setStatus("已取消锁定 Codex 上下文。");
+                      }}
+                      onOpenFile={(path) => void runSafely(() => handleOpenCodexContextFile(path))}
+                      onOpenSymbol={(symbol) => void runSafely(() => handleOpenCodexContextSymbol(symbol))}
+                      onRemoveMention={handleRemoveCodexPromptMention}
+                    />
 	                    <textarea
 	                      ref={codexPromptInputRef}
 	                      value={codexPrompt}
@@ -8265,185 +8066,6 @@ function CompileErrorPanel({
   );
 }
 
-function CodexProgressView({
-  events,
-  prompt,
-  changedFiles = [],
-  isRunning,
-  isCancelling,
-  mode,
-  onCancel,
-  onRetry,
-}: {
-  events: CodexRunEvent[];
-  prompt?: string;
-  changedFiles?: string[];
-  isRunning: boolean;
-  isCancelling: boolean;
-  mode: CodexRunMode;
-  onCancel?: () => void;
-  onRetry?: () => void;
-}) {
-  const displayEvents = events.filter((event) => event.message.trim());
-  const assistantMessages = uniqueStrings(
-    displayEvents
-      .filter((event) => event.kind === "assistant")
-      .map((event) => event.message.trim())
-      .filter(Boolean),
-  );
-  const fileChanges = uniqueStrings(
-    displayEvents
-      .filter((event) => event.kind === "file-change")
-      .map((event) => event.message.trim())
-      .filter(Boolean),
-  );
-  const errors = displayEvents.filter((event) => event.kind === "error");
-  const latestError = errors[errors.length - 1];
-  const timelineEvents = displayEvents
-    .filter((event) => !["file-change", "assistant"].includes(event.kind))
-    .slice(-5);
-  const state = isCancelling
-    ? "正在取消"
-    : errors.length && !isRunning
-      ? "需要处理"
-      : isRunning
-        ? mode === "ask"
-          ? "正在分析"
-          : "正在修改"
-        : displayEvents.some((event) => event.kind === "completed")
-          ? "已完成"
-          : "准备中";
-  const completed = displayEvents.some((event) => event.kind === "completed");
-  const concreteSummary =
-    changedFiles.length > 0
-      ? `已完成修改，涉及 ${changedFiles.length} 个文件：${changedFiles.slice(0, 6).join("、")}${
-          changedFiles.length > 6 ? `，以及另外 ${changedFiles.length - 6} 个文件` : ""
-        }。下方可以确认修改或查看 diff。`
-      : completed
-        ? mode === "ask"
-          ? "Codex 已完成分析，但没有返回可显示的正文。可以展开运行细节查看过程。"
-          : "Codex 已完成，本次没有检测到文件变化。可以展开运行细节查看过程。"
-        : "Codex 正在处理你的要求，具体回复或修改结果会显示在这里。";
-  const headingMessage = assistantMessages.length > 0 ? "Codex 已返回具体输出。" : concreteSummary;
-  const canRetry = Boolean(!isRunning && errors.length > 0 && prompt?.trim() && onRetry);
-
-  return (
-    <div className="codex-progress-view" aria-label="Codex 运行进度">
-      <div className="codex-progress-heading">
-        <Bot size={16} />
-        <div>
-          <strong>{state}</strong>
-          <span>{headingMessage}</span>
-        </div>
-        <span
-          className={[
-            "codex-progress-state",
-            isRunning ? "codex-progress-state-running" : "",
-            errors.length ? "codex-progress-state-error" : "",
-          ]
-            .filter(Boolean)
-            .join(" ")}
-        >
-          {displayEvents.length} 步
-        </span>
-        {isRunning && onCancel && (
-          <button
-            type="button"
-            className="codex-stop-button codex-progress-stop"
-            onClick={onCancel}
-            disabled={isCancelling}
-            title={mode === "ask" ? "终止本次 Codex 分析" : "终止本次 Codex 修改"}
-            aria-label="终止 Codex"
-          >
-            <XCircle size={13} />
-            <span>{isCancelling ? "终止中" : "终止"}</span>
-          </button>
-        )}
-        {canRetry && (
-          <button
-            type="button"
-            className="codex-retry-button"
-            onClick={onRetry}
-            title={mode === "ask" ? "重新运行这次 Codex 分析" : "重新运行这次 Codex 修改"}
-            aria-label="重试 Codex"
-          >
-            <RefreshCcw size={13} />
-            <span>重试</span>
-          </button>
-        )}
-      </div>
-      <div className="codex-chat-transcript" aria-label="Codex 对话记录">
-        {prompt?.trim() && (
-          <div className="codex-chat-row codex-chat-row-user">
-            <div className="codex-chat-avatar">你</div>
-            <div className="codex-chat-bubble">
-              <div className="codex-chat-author">你的要求</div>
-              <p>{prompt.trim()}</p>
-            </div>
-          </div>
-        )}
-        {assistantMessages.length > 0 ? (
-          assistantMessages.slice(-4).map((message, index) => (
-            <div className="codex-chat-row codex-chat-row-assistant" key={`${index}-${message}`}>
-              <div className="codex-chat-avatar">
-                <Bot size={13} />
-              </div>
-              <div className="codex-chat-bubble">
-                <div className="codex-chat-author">Codex</div>
-                <p>{message}</p>
-              </div>
-            </div>
-          ))
-        ) : (
-          <div className="codex-chat-row codex-chat-row-assistant codex-chat-row-muted">
-            <div className="codex-chat-avatar">
-              <Bot size={13} />
-            </div>
-            <div className="codex-chat-bubble">
-              <div className="codex-chat-author">Codex</div>
-              <p>{concreteSummary}</p>
-            </div>
-          </div>
-        )}
-      </div>
-      {fileChanges.length > 0 && (
-        <div className="codex-progress-files">
-          <div className="codex-progress-section-title">已检测到文件变化</div>
-          {fileChanges.slice(0, 8).map((file) => (
-            <span key={file}>
-              <FileText size={12} />
-              {file}
-            </span>
-          ))}
-          {fileChanges.length > 8 && <small>还有 {fileChanges.length - 8} 个文件</small>}
-        </div>
-      )}
-      {errors.length > 0 && (
-        <div className="codex-progress-error">
-          <AlertTriangle size={14} />
-          <span>{latestError?.message ?? "Codex 运行遇到问题。"}</span>
-        </div>
-      )}
-      {timelineEvents.length > 0 && (
-        <details className="codex-progress-details">
-          <summary>运行细节</summary>
-          <div className="codex-progress-timeline">
-            {timelineEvents.map((event, index) => (
-              <div
-                className={`codex-progress-step codex-progress-step-${event.kind}`}
-                key={`${event.kind}-${index}-${event.message}`}
-              >
-                <span />
-                <p>{event.message}</p>
-              </div>
-            ))}
-          </div>
-        </details>
-      )}
-    </div>
-  );
-}
-
 function isTextPath(path: string) {
   const extension = path.split(".").pop()?.toLowerCase() ?? "";
   return textExtensions.has(extension);
@@ -9266,16 +8888,6 @@ function readCodexSymbolSourceContext(symbol: ProjectSymbol, content: string): C
   };
 }
 
-function formatCodexHistoryTime(createdAt: number) {
-  if (!createdAt) return "未知时间";
-  return new Date(createdAt * 1000).toLocaleString("zh-CN", {
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
 function formatCompileTime(timestamp: number) {
   return new Date(timestamp).toLocaleTimeString("zh-CN", {
     hour: "2-digit",
@@ -9285,7 +8897,13 @@ function formatCompileTime(timestamp: number) {
 }
 
 function formatHistoryTime(createdAt: number) {
-  return formatCodexHistoryTime(createdAt);
+  if (!createdAt) return "未知时间";
+  return new Date(createdAt * 1000).toLocaleString("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 }
 
 function uniqueStrings(values: string[]) {
@@ -10110,95 +9728,6 @@ function latexSnippetSuggestions(monacoApi: MonacoApi) {
     keepWhitespace: true,
     rules: monacoApi.languages.CompletionItemInsertTextRule.InsertAsSnippet,
   }));
-}
-
-function loadBooleanPreference(key: string, fallback: boolean) {
-  try {
-    const value = window.localStorage.getItem(key);
-    if (value === "true") return true;
-    if (value === "false") return false;
-  } catch {
-    // localStorage can be unavailable in restricted webviews.
-  }
-  return fallback;
-}
-
-function saveBooleanPreference(key: string, value: boolean) {
-  try {
-    window.localStorage.setItem(key, String(value));
-  } catch {
-    // Preference persistence is helpful but not required for editing.
-  }
-}
-
-function loadNumberPreference(key: string, fallback: number, min: number, max: number) {
-  try {
-    const value = Number.parseInt(window.localStorage.getItem(key) ?? "", 10);
-    if (Number.isFinite(value)) {
-      return clamp(value, min, max);
-    }
-  } catch {
-    // localStorage can be unavailable in restricted webviews.
-  }
-  return fallback;
-}
-
-function saveNumberPreference(key: string, value: number) {
-  try {
-    window.localStorage.setItem(key, String(Math.round(value)));
-  } catch {
-    // Preference persistence is helpful but not required for editing.
-  }
-}
-
-function loadViewModePreference(key: string, fallback: ViewMode) {
-  try {
-    const value = window.localStorage.getItem(key);
-    if (value === "editor" || value === "split" || value === "preview") {
-      return value;
-    }
-  } catch {
-    // localStorage can be unavailable in restricted webviews.
-  }
-  return fallback;
-}
-
-function saveViewModePreference(key: string, value: ViewMode) {
-  try {
-    window.localStorage.setItem(key, value);
-  } catch {
-    // Preference persistence is helpful but not required for editing.
-  }
-}
-
-function loadShortcutPreferences(): ShortcutMap {
-  try {
-    const value = window.localStorage.getItem(SHORTCUT_PREF_KEY);
-    if (value) {
-      const parsed = JSON.parse(value) as Partial<ShortcutMap>;
-      return normalizeShortcutMap({ ...DEFAULT_SHORTCUTS, ...parsed });
-    }
-  } catch {
-    // Shortcut customization is optional; defaults keep the editor usable.
-  }
-  return DEFAULT_SHORTCUTS;
-}
-
-function saveShortcutPreferences(value: ShortcutMap) {
-  try {
-    window.localStorage.setItem(SHORTCUT_PREF_KEY, JSON.stringify(normalizeShortcutMap(value)));
-  } catch {
-    // Preference persistence is helpful but not required for editing.
-  }
-}
-
-function normalizeShortcutMap(value: Partial<ShortcutMap>): ShortcutMap {
-  return SHORTCUT_DEFINITIONS.reduce((accumulator, definition) => {
-    accumulator[definition.id] =
-      normalizeShortcutInput(value[definition.id] ?? DEFAULT_SHORTCUTS[definition.id]) ||
-      DEFAULT_SHORTCUTS[definition.id];
-    return accumulator;
-  }, {} as ShortcutMap);
 }
 
 async function restoreEditorSessionTabs(projectRoot: string, mainFile: string) {

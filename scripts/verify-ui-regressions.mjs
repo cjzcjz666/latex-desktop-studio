@@ -7,6 +7,7 @@ const packageJson = readFileSync(new URL("../package.json", import.meta.url), "u
 const editorLogic = readFileSync(new URL("../src/lib/editorLogic.ts", import.meta.url), "utf8");
 const codexContext = readFileSync(new URL("../src/lib/codexContext.ts", import.meta.url), "utf8");
 const monacoLatex = readFileSync(new URL("../src/lib/monacoLatex.ts", import.meta.url), "utf8");
+const preferences = readFileSync(new URL("../src/lib/preferences.ts", import.meta.url), "utf8");
 const types = readFileSync(new URL("../src/types.ts", import.meta.url), "utf8");
 const editorLogicTests = readFileSync(new URL("./test-editor-logic.mjs", import.meta.url), "utf8");
 const tauriConfig = readFileSync(new URL("../src-tauri/tauri.conf.json", import.meta.url), "utf8");
@@ -15,8 +16,17 @@ const macInfoPlist = readFileSync(new URL("../src-tauri/Info.plist", import.meta
 const tauri = readFileSync(new URL("../src/tauri.ts", import.meta.url), "utf8");
 const pdfPreview = readFileSync(new URL("../src/components/PdfPreview.tsx", import.meta.url), "utf8");
 const fileTreeNode = readFileSync(new URL("../src/components/FileTreeNode.tsx", import.meta.url), "utf8");
+const codexAnswerView = readFileSync(new URL("../src/components/CodexAnswerView.tsx", import.meta.url), "utf8");
+const codexContextStrip = readFileSync(new URL("../src/components/CodexContextStrip.tsx", import.meta.url), "utf8");
 const codexDiffView = readFileSync(new URL("../src/components/CodexDiffView.tsx", import.meta.url), "utf8");
+const codexHistoryList = readFileSync(new URL("../src/components/CodexHistoryList.tsx", import.meta.url), "utf8");
+const codexProgressView = readFileSync(new URL("../src/components/CodexProgressView.tsx", import.meta.url), "utf8");
+const appAndPreferences = `${app}\n${preferences}`;
+const appAndCodexAnswer = `${app}\n${codexAnswerView}`;
+const appAndCodexContextStrip = `${app}\n${codexContextStrip}\n${codexContext}`;
 const appAndCodexDiff = `${app}\n${codexDiffView}`;
+const appAndCodexHistory = `${app}\n${codexHistoryList}\n${codexDiffView}`;
+const appAndCodexProgress = `${app}\n${codexProgressView}`;
 const appAndCodexContext = `${app}\n${codexContext}`;
 const appCodexDiffAndContext = `${appAndCodexDiff}\n${codexContext}`;
 
@@ -59,7 +69,7 @@ addCheck(
 
 addCheck(
   "workspace layout widths, view mode, and panel collapse states persist across app launches",
-  includesAll(app, [
+  includesAll(appAndPreferences, [
     'const SIDEBAR_WIDTH_PREF_KEY = "latex-studio:sidebar-width"',
     'const PREVIEW_WIDTH_PREF_KEY = "latex-studio:preview-width"',
     'const VIEW_MODE_PREF_KEY = "latex-studio:view-mode"',
@@ -396,7 +406,7 @@ addCheck(
 
 addCheck(
   "editor-only, split, and preview-only modes are exposed through the minimal view toggle",
-  includesAll(app, [
+  includesAll(appAndPreferences, [
     'type ViewMode = "editor" | "split" | "preview"',
     "handleCycleViewMode",
     "handleTogglePreviewShortcut",
@@ -799,7 +809,7 @@ addCheck(
 
 addCheck(
   "Codex editing remains cancellable, revertible, and diff-based",
-  includesAll(app, [
+  includesAll(appAndCodexProgress, [
     "handleCancelCodex",
     "handleRevertCodex",
     "CodexRunMode",
@@ -834,7 +844,7 @@ addCheck(
 
 addCheck(
   "Codex failed runs can retry the previous natural-language request with fresh context",
-  includesAll(app, [
+  includesAll(appAndCodexProgress, [
     "handleRetryCodexRun",
     "const prompt = codexConversationPrompt.trim();",
     "setCodexPrompt(prompt);",
@@ -1066,7 +1076,7 @@ addCheck(
 
 addCheck(
   "Codex history keeps prompt previews and final messages for traceable natural-language edits",
-  includesAll(appAndCodexDiff, [
+  includesAll(appAndCodexHistory, [
     "item.promptPreview",
     "item.finalMessage",
     "handleReuseCodexHistoryPrompt",
@@ -1101,6 +1111,22 @@ addCheck(
     hasCssBlock(".codex-history-reuse", ["height: 28px;", "padding: 0 7px;"]) &&
     hasCssBlock(".codex-diff-prompt", ["color: #2d3a45 !important;", "font-weight: 640;"]) &&
     hasCssBlock(".codex-diff-message", ["background: #f5faf7;", "border-left: 3px solid #9bc7b1;"]),
+);
+
+addCheck(
+  "Codex history list lives outside the main App component",
+  includesAll(app, [
+    'import { CodexHistoryList } from "./components/CodexHistoryList"',
+    "<CodexHistoryList",
+  ]) &&
+    includesAll(codexHistoryList, [
+      "export function CodexHistoryList",
+      "CodexHistoryItem",
+      "formatCodexHistoryTime",
+      "复用这条 Codex 指令",
+      "未记录指令",
+    ]) &&
+    !app.includes('className="codex-history-main"'),
 );
 
 addCheck(
@@ -1466,7 +1492,7 @@ addCheck(
 
 addCheck(
   "Codex run events render as a chat transcript with collapsible run details",
-  includesAll(app, [
+  includesAll(appAndCodexProgress, [
     "CodexProgressView",
     "aria-label=\"Codex 运行进度\"",
     "aria-label=\"Codex 对话记录\"",
@@ -1493,7 +1519,7 @@ addCheck(
     "已完成修改，涉及",
     "下方可以确认修改或查看 diff",
   ]) &&
-    !app.includes("codexEvents.map((event, index)") &&
+    !appAndCodexProgress.includes("codexEvents.map((event, index)") &&
     hasCssBlock(".codex-progress-view", [
       "background: #ffffff;",
       "border: 1px solid #d8dee6;",
@@ -1511,6 +1537,22 @@ addCheck(
       "background: #fff4f2;",
       "border: 1px solid #efc6bf;",
     ]),
+);
+
+addCheck(
+  "Codex progress transcript lives outside the main App component",
+  includesAll(app, [
+    'import { CodexProgressView } from "./components/CodexProgressView"',
+    "<CodexProgressView",
+  ]) &&
+    includesAll(codexProgressView, [
+      "export function CodexProgressView",
+      "CodexRunEvent",
+      "codex-chat-transcript",
+      "codex-progress-details",
+      "Codex 已返回具体输出。",
+    ]) &&
+    !app.includes("function CodexProgressView"),
 );
 
 addCheck(
@@ -1790,11 +1832,11 @@ addCheck(
 
 addCheck(
   "Codex prompt context is visible as removable chips before running",
-  includesAll(app, [
+  includesAll(appAndCodexContextStrip, [
     "codexPromptReferencedFiles",
     "codexPromptReferencedSymbols",
     "codexEditableScopeFiles",
-    "hasCodexVisibleContext",
+    "hasVisibleContext",
     "codex-context-strip",
     "Codex 已选上下文",
     "handleOpenCodexContextFile",
@@ -1802,7 +1844,7 @@ addCheck(
     "handleRemoveCodexPromptMention",
     "removeCodexPromptMention(codexPrompt, trigger, value)",
     "uniqueProjectSymbolByKey(projectSymbols, key)",
-    "formatCodexContextHint(pinnedCodexContext)",
+    "formatCodexContextHint(pinnedContext)",
     "当前 diff",
     "仅改上下文",
     "已移除 ${trigger}${value} 上下文引用。",
@@ -1816,8 +1858,26 @@ addCheck(
 );
 
 addCheck(
+  "Codex context chips live outside the main App component",
+  includesAll(app, [
+    'import { CodexContextStrip } from "./components/CodexContextStrip"',
+    "<CodexContextStrip",
+  ]) &&
+    includesAll(codexContextStrip, [
+      "export function CodexContextStrip",
+      "CodexPreflightItem",
+      "codex-context-chip-pinned",
+      "codex-context-chip-file",
+      "codex-context-chip-scope",
+      "codex-preflight-strip",
+    ]) &&
+    !app.includes('className="codex-context-chip-main"') &&
+    !app.includes('className="codex-preflight-strip"'),
+);
+
+addCheck(
   "Codex command box shows a compact preflight before running",
-  includesAll(appAndCodexContext, [
+  includesAll(appAndCodexContextStrip, [
     "codexPreflightItems",
     "shouldShowCodexPreflight",
     "Codex 运行前预检",
@@ -2063,7 +2123,7 @@ addCheck(
 
 addCheck(
   "Codex ask output can be copied and converted into edit prompts or review comments",
-  includesAll(app, [
+  includesAll(appAndCodexAnswer, [
     "handleCopyCodexAnswer",
     "navigator.clipboard.writeText(codexAnswer)",
     "handleUseCodexAnswerAsEditPrompt",
@@ -2095,6 +2155,22 @@ addCheck(
       "height: 28px;",
       "background: #f5f8fb;",
     ]),
+);
+
+addCheck(
+  "Codex answer view lives outside the main App component",
+  includesAll(app, [
+    'import { CodexAnswerView } from "./components/CodexAnswerView"',
+    "<CodexAnswerView",
+  ]) &&
+    includesAll(codexAnswerView, [
+      "export function CodexAnswerView",
+      "Codex 输出",
+      "复制 Codex 回答",
+      "把回答转成修改指令",
+      "把回答插入为 REVIEW 批注",
+    ]) &&
+    !app.includes('className="codex-answer-actions"'),
 );
 
 addCheck(
@@ -2478,7 +2554,7 @@ addCheck(
 
 addCheck(
   "Overleaf-style keyboard shortcuts are configurable and still work inside Monaco",
-  includesAll(app, [
+  includesAll(appAndPreferences, [
     "window.addEventListener(\"keydown\", handleKeyDown)",
     "SHORTCUT_PREF_KEY",
     "DEFAULT_SHORTCUTS",
@@ -2547,8 +2623,27 @@ addCheck(
 );
 
 addCheck(
-  "Codex editor context can be locked from keyboard without leaving the editor",
+  "preference and shortcut persistence lives outside the main App component",
   includesAll(app, [
+    'from "./lib/preferences"',
+    "loadBooleanPreference",
+    "saveShortcutPreferences",
+    "SHORTCUT_DEFINITIONS.map",
+  ]) &&
+    includesAll(preferences, [
+      'const SHORTCUT_PREF_KEY = "latex-studio:shortcuts"',
+      "export const DEFAULT_SHORTCUTS",
+      "export const SHORTCUT_DEFINITIONS",
+      "export function loadShortcutPreferences",
+      "export function normalizeShortcutMap",
+    ]) &&
+    !app.includes("function loadBooleanPreference") &&
+    !app.includes("function normalizeShortcutMap"),
+);
+
+addCheck(
+  "Codex editor context can be locked from keyboard without leaving the editor",
+  includesAll(appAndPreferences, [
     '| "codexContext"',
     'codexContext: "⌘⇧K"',
     '{ id: "codexContext", label: "锁定上下文"',
@@ -2563,7 +2658,7 @@ addCheck(
 
 addCheck(
   "source-to-PDF SyncTeX has a configurable shortcut and toolbar hint",
-  includesAll(app, [
+  includesAll(appAndPreferences, [
     '| "syncPdf"',
     'syncPdf: "⌘⌥P"',
     '{ id: "syncPdf", label: "定位 PDF"',
@@ -2895,7 +2990,7 @@ addCheck(
 
 addCheck(
   "Review mode has a visible button, configurable shortcut, and editor highlights",
-  includesAll(app, [
+  includesAll(appAndPreferences, [
     '"reviewMode"',
     'reviewMode: "⌘⇧M"',
     '"insertReviewComment"',
